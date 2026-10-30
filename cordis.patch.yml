@@ -1,0 +1,9 @@
+# dsh-memory-checkpoint — bundle patch layer
+#
+# 把本插件声明为一个标准 Cordis loader entry，使其能作为 profile bundle 挂载：
+#   `dsh plugin --profile <p> add dsh-memory-checkpoint`
+# 桌面端 profile 被 Electron 独占（CLI 会报 managed exclusively），因此实际做法是
+# 手动装进 profile 的 node_modules 并把包名加进 package.json 的 dsh.profile.bundles。
+- insert:
+    - id: memory-checkpoint
+      name: 'dsh-memory-checkpoint'

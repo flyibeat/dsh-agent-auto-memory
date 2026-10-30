@@ -1,0 +1,37 @@
+{
+  "name": "dsh-memory-checkpoint",
+  "version": "0.1.0",
+  "description": "Turn-end memory checkpoint for DeepSeek Harness: uses the native agent/turn-stopping extension point to remind the model to persist conclusions, replacing the unavailable Claude Code Stop hook bridge.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "memory",
+    "hooks"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dsh": ">=0.2.1-rc.3 <0.3.0",
+      "node": ">=22.18"
+    },
+    "profiles": [
+      "desktop",
+      "web"
+    ]
+  }
+}
