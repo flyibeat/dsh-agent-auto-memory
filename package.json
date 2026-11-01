@@ -6,12 +6,14 @@
   "main": "index.js",
   "exports": {
     ".": "./index.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "index.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "locale"
   ],
   "license": "MIT",
   "keywords": [

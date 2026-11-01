@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Turn-end memory checkpoint",
+    "description": "Turn-end memory checkpoint for DeepSeek Harness: uses the native agent/turn-stopping extension point to remind the model to persist conclusions, replacing the unavailable Claude Code Stop hook bridge."
+  }
+}
