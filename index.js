@@ -13,8 +13,12 @@
  *   3. 本轮无此类工具活动  → 静默（纯问答/只读不打扰）
  *   4. 任何异常            → 静默放行（绝不因为质检失败而打断对话）
  *
- * 工具名来源：`tools/pre-execute` 的 `exec.name`（`session/event` 的
- * `tool/result` 里只有 `source.callId`，拿不到工具名，不能用作判据）。
+ * 工具名来源（两路并用）：
+ *   - `tools/pre-execute` 的 `exec.name`：只覆盖模型直接发起的顶层工具调用；
+ *   - `session/event` 的 `tool/call` / `tool/ptc-dispatch` 的 `data.name`：
+ *     PTC 模式下嵌套工具由 dsh-ops 自己的执行层派发，不经过 dsh-tools 的
+ *     `prepare()`，`tools/pre-execute` 不会触发，只靠它会漏判。
+ *   （`tool/result` 里只有 `source.callId`，拿不到工具名，不能用作判据。）
  */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -117,7 +121,15 @@ export function apply(ctx, config) {
   // 轮次开始 → 重置本轮的「干过活」状态
   ctx.on('session/event', (session, event) => {
     try {
-      if (session?.id && event?.type === 'turn/start') sawMutation.set(session.id, false);
+      if (!session?.id) return;
+      if (event?.type === 'turn/start') {
+        sawMutation.set(session.id, false);
+        return;
+      }
+      // PTC 嵌套工具走不到 tools/pre-execute，只能从会话事件里取工具名
+      if (event?.type === 'tool/call' || event?.type === 'tool/ptc-dispatch') {
+        if (isMutating(event?.data?.name)) sawMutation.set(session.id, true);
+      }
     } catch {
       /* 静默 */
     }
@@ -139,8 +151,6 @@ export function apply(ctx, config) {
 
       if (sawMutation.get(sid) !== true) return; // 判据 3：没干活不打扰
       if (alreadyPromptedToday()) return;        // 判据 1：今天已提示过
-      if (!markPrompted()) return;               // 写不了标记就别打扰
-
       ctx.logger?.info?.(`[${NS}] turn-stopping: reminding once (turn=${turn})`);
       // steer 契约是完整 UserMessage：v4 读取端 assertMessageEventShape 要求
       // id（非空串）、role:'user'、source 对象、content 数组，缺一即判会话 corrupt。
@@ -151,6 +161,8 @@ export function apply(ctx, config) {
         content: [{ type: 'text', text: reason }],
         source: { kind: NS },
       });
+      // 标记必须写在 steer 成功之后：先写会让「注入失败」也耗掉当天额度，用户再也收不到提醒
+      if (!markPrompted()) ctx.logger?.warn?.(`[${NS}] markPrompted failed after steer`);
     } catch (error) {
       // 判据 4：任何异常静默放行，绝不打断对话
       ctx.logger?.warn?.(`[${NS}] turn-stopping check failed: ${String(error)}`);

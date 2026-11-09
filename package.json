@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-checkpoint",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Turn-end memory checkpoint for DeepSeek Harness: uses the native agent/turn-stopping extension point to remind the model to persist conclusions, replacing the unavailable Claude Code Stop hook bridge.",
   "type": "module",
   "main": "index.js",
