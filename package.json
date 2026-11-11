@@ -1,19 +1,31 @@
 {
-  "name": "dsh-memory-checkpoint",
-  "version": "0.1.1",
-  "description": "Turn-end memory checkpoint for DeepSeek Harness: uses the native agent/turn-stopping extension point to remind the model to persist conclusions, replacing the unavailable Claude Code Stop hook bridge.",
+  "name": "dsh-agent-auto-memory",
+  "version": "1.0.0",
+  "description": "Auditable automatic memory infrastructure for DeepSeek Harness: turn-end checkpoint reminders plus a revision-checked shared-memory writer.",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./checkpoint": "./checkpoint-entry.js",
+    "./writer": "./writer-entry.js",
     "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
+    "./checkpoint/locale/*.json": "./locale/checkpoint/*.json",
+    "./checkpoint/icon": "./icon-checkpoint.svg",
+    "./writer/locale/*.json": "./locale/writer/*.json",
+    "./writer/icon": "./icon-writer.svg"
   },
   "files": [
     "index.js",
+    "checkpoint-entry.js",
+    "writer-entry.js",
+    "checkpoint.mjs",
+    "memory-tool.mjs",
+    "memory-store.mjs",
     "cordis.patch.yml",
     "README.md",
-    "locale"
+    "locale",
+    "icon-checkpoint.svg",
+    "icon-writer.svg"
   ],
   "license": "MIT",
   "keywords": [
@@ -21,8 +33,13 @@
     "deepseek-harness",
     "cordis",
     "memory",
+    "agent-memory",
     "hooks"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flyibeat/dsh-agent-auto-memory.git"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

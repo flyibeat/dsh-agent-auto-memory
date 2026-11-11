@@ -11,7 +11,7 @@ const TMP = path.join(os.tmpdir(), 'memckpt-' + Date.now());
 fs.mkdirSync(TMP, { recursive: true });
 process.env.DSH_HOME = TMP;
 
-const mod = await import('./index.js');
+const mod = await import('./checkpoint-entry.js');
 
 let pass = 0, fail = 0;
 const check = (name, cond) => {
@@ -67,7 +67,7 @@ function resetHome(tag) {
 
 console.log('\n=== 1. 模块形态 ===');
 check('导出 apply', typeof mod.apply === 'function');
-check('导出 name', mod.name === 'memory-checkpoint');
+check('导出 name', mod.name === 'agent-auto-memory-checkpoint');
 
 console.log('\n=== 2. 纯问答（无工具）→ 静默 ===');
 {
@@ -173,7 +173,7 @@ console.log('\n=== 11. 标记文件位置与内容 ===');
   await ctx.emit('session/event', { id: 's' }, { type: 'turn/start' });
   await callTool(ctx, 's', 'write');
   await ctx.emit('agent/turn-stopping', { agent: mkAgent(ctx, 's'), turn: 1 });
-  const mf = path.join(home, 'logs', 'memory-checkpoint-last.json');
+  const mf = path.join(home, 'logs', 'agent-auto-memory-checkpoint-last.json');
   check('标记文件存在', fs.existsSync(mf));
   if (fs.existsSync(mf)) {
     const j = JSON.parse(fs.readFileSync(mf, 'utf8'));

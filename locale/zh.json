@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "轮末记忆质检",
-    "description": "DeepSeek Harness 的轮末记忆沉淀提醒：用原生 agent/turn-stopping 扩展点提醒模型把本轮的结论写进记忆文件，替代已失效的 Claude Code Stop 钩子。"
+    "title": "Agent 自动记忆",
+    "description": "DeepSeek Harness 的自动记忆基础设施：轮末沉淀提醒与带版本校验的共享记忆写入。"
   }
 }

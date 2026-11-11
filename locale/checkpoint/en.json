@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Automatic memory checkpoint",
+    "description": "Reminds the Agent at turn end when durable conclusions may still need to be saved."
+  }
+}

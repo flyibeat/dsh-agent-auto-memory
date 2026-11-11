@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Shared memory writer",
+    "description": "Writes only shared Agent memory files with revision checks, backups, and atomic replacement."
+  }
+}
