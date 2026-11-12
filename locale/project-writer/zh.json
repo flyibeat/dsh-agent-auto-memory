@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "项目记忆写入器",
+    "description": "写入会话所属项目的 AGENTS.md 与 .agents/topics/，带版本校验、备份和原子替换。"
+  }
+}

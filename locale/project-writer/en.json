@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Project memory writer",
+    "description": "Writes the owning project's AGENTS.md and .agents/topics/ with revision checks, backups, and atomic replacement."
+  }
+}

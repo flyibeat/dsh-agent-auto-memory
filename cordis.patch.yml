@@ -4,3 +4,5 @@
       name: 'dsh-agent-auto-memory/checkpoint'
     - id: agent-auto-memory-writer
       name: 'dsh-agent-auto-memory/writer'
+    - id: agent-auto-memory-project-writer
+      name: 'dsh-agent-auto-memory/project-writer'

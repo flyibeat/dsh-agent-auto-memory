@@ -5,18 +5,19 @@ DeepSeek Harness（DSH）的自动记忆基础设施插件，与 Agent Skill `ag
 ## 分工
 
 - **Skill：agent-auto-memory** —— 告诉 Agent 什么值得记、跨项目/项目级怎么分流、怎样判重、维护索引与控制预算。
-- **插件：dsh-agent-auto-memory** —— 提供程序层能力：轮末漏写提醒 + 最小权限共享记忆写入。
+- **插件：dsh-agent-auto-memory** —— 提供程序层能力：轮末漏写提醒 + 最小权限共享记忆写入 + 所属项目的项目级记忆写入。
 
 插件不总结对话，也不自行决定记什么；内容决策始终由 Agent 按 Skill 执行。
 
-## 一个包，两项独立能力
+## 一个包，三项独立能力
 
-Bundle 安装两个 Cordis 插件行，可在插件管理器分别启停：
+Bundle 安装三个 Cordis 插件行，可在插件管理器分别启停：
 
 | 行 ID | 能力 | 默认 |
 |---|---|---|
 | `agent-auto-memory-checkpoint` | 在 `agent/turn-stopping` 检查本轮是否可能漏写记忆，必要时 steer 提醒 | 开 |
 | `agent-auto-memory-writer` | 注册 `write_shared_memory`，只写共享 Agent 记忆根 | 开 |
+| `agent-auto-memory-project-writer` | 注册 `write_project_memory`，写会话所属项目的 `AGENTS.md` 与 `.agents/topics/` | 开 |
 
 也可在 profile patch 中按 ID 设置 `disabled: true`，互不影响。
 
@@ -38,6 +39,27 @@ Bundle 安装两个 Cordis 插件行，可在插件管理器分别启停：
 更新流程：临时目录备份 → 同目录独占临时文件 → flush/fsync → 再核对 revision 与真实目录 → 原子 rename。Host 内写入串行排队；同 revision 并发竞争最多一个成功。
 
 共享根按 `$DSH_AGENTS_HOME` 解析，默认 `~/.agents`。根目录必须在安装/迁移时预先创建，工具不会自行创建或扩大权限。
+
+## 项目记忆写入能力
+
+会话工作区常常是项目的子目录（例如 `项目/撰写/2026-11-08-某题`），此时沙箱可写根只有那个子目录，父项目的 `.agents/topics/` 在可写根之外，普通 `write` 一律 `file access denied`，提权又会走审批。工具 `write_project_memory` 补上这条路：
+
+- 从**会话工作区**（`exec.agent.session.header.cwd`，不是宿主进程 cwd）向上找最近的、含 `.agents` 或 `AGENTS.md` 的目录，**最多上溯 3 层**；找不到就报错并列出查过的目录，不静默回退到共享根。
+- 只接受 `AGENTS.md` 与 `.agents/topics/<单个安全 Markdown 文件名>.md`，同样必须带 `expectedRevision`（新建传 `"absent"`），同样的备份、原子替换、串行队列与链接拒绝。
+- 越界防护：路径逃逸、嵌套目录、Windows 保留名、符号链接/junction、超过 1 MiB、revision 冲突一律拒绝。
+
+可配置（通常不需要）：
+
+```yaml
+- id: agent-auto-memory-project-writer
+  config:
+    enabled: true
+    toolName: write_project_memory
+    markers: ['.agents', 'AGENTS.md']   # 判定项目根的标记
+    maxLevels: 3                        # 最多上溯几层
+    projectRoot: D:\\work\\my-project    # 钉死项目根（不自动探测）
+    projectRoots: [D:\\work\\my-project] # 允许列表；探测结果不在此列即拒绝
+```
 
 ## 配置
 
@@ -88,6 +110,7 @@ node --check memory-tool.mjs
 node --check memory-store.mjs
 node test-offline.mjs
 node test-writer.mjs
+node test-project-writer.mjs
 node test-integration.mjs
 npm pack --dry-run
 ```
