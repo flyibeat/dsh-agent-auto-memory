@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-auto-memory",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Auditable automatic memory infrastructure for DeepSeek Harness: turn-end checkpoint reminders plus a revision-checked shared-memory writer.",
   "type": "module",
   "main": "index.js",

@@ -33,7 +33,7 @@ Bundle 安装两个 Cordis 插件行，可在插件管理器分别启停：
 - `AGENTS.md`
 - `topics/<单个安全 Markdown 文件名>.md`
 
-必传完整 UTF-8 内容和 `expectedRevision`（已读取的 SHA-256；创建用 `absent`）。工具拒绝删除、移动、路径穿越、嵌套目录、Windows 保留名、非法字符、超过 1 MiB、符号链接/junction 和 revision 冲突。
+必传完整 UTF-8 内容和 `expectedRevision`（已读取的 SHA-256；**创建新文件时传字面量字符串 `"absent"`，不能省略该参数**——省略、空串、`null` 都会被拒为 `expectedRevision must be absent or a lowercase SHA-256`）。工具拒绝删除、移动、路径穿越、嵌套目录、Windows 保留名、非法字符、超过 1 MiB、符号链接/junction 和 revision 冲突。
 
 更新流程：临时目录备份 → 同目录独占临时文件 → flush/fsync → 再核对 revision 与真实目录 → 原子 rename。Host 内写入串行排队；同 revision 并发竞争最多一个成功。
 
