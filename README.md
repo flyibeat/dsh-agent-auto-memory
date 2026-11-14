@@ -118,3 +118,38 @@ npm pack --dry-run
 ## 许可
 
 MIT
+## Workspace grant: 让子工作区会话能写父项目根
+
+DSH 的 `workspace-write` 只放行**会话工作区根**。会话开在 `<项目根>\<子目录>` 时，父项目根的
+`AGENTS.md`、`.agents/topics/`、项目登记表、`skills/` 全在可写根之外，普通 `write`/`edit` 一律
+`file access denied`，只能逐次提权。
+
+本插件行 `agent-auto-memory-workspace-grant` 用 sandbox-policy 的正规运行时接口按会话授权项目根：
+
+```
+ctx.sandboxPolicy.registerWritableRoot(session, directory)
+```
+
+项目根判定与 `project-writer` 完全一致（从会话 `header.cwd` 向上找最近的、含 `.agents` 或
+`AGENTS.md` 的目录，最多 `maxLevels` 层）。会话一建立就注册，恢复/派生的会话在下一个
+`turn/start` 补登记；同一会话只注册一次。
+
+### 配置
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `true` | 设为 `false` 关闭本行。 |
+| `markers` | `['.agents', 'AGENTS.md']` | 判定项目根用的标记文件/目录。 |
+| `maxLevels` | `3` | 最多向上找几层。 |
+| `extraRoots` | `[]` | 额外授权目录；**只发给 cwd 落在该目录之内的会话**。 |
+| `audit` | `true` | 追加一行到 `<DSH_HOME>/logs/agent-auto-memory-workspace-grant.log`。 |
+
+### 边界（必须知道）
+
+- **Windows 上额外目录授权只对 harness 文件工具生效**，沙箱子进程（bash / pwsh）忽略它。命令里建
+  `.bak`、跑脚本仍会被拒。
+- **额外根覆盖「写」但不覆盖「删」**：`write`/`edit` 可以，`unlink`/`rm`/`Remove-Item` 仍报
+  `EPERM` / `Permission denied`。
+- 授权只属于**这一个存活 Session**：其它会话、子 agent 的会话不继承；恢复或派生的会话需要重新注册。
+- 会话中途改 cwd **不会**重新授权（`granted.has(session)` 短路），需要新会话。
+- `read-only` 模式下不授予任何写入。

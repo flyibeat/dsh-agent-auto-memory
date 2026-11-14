@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-auto-memory",
-  "version": "1.0.2",
-  "description": "Auditable automatic memory infrastructure for DeepSeek Harness: turn-end checkpoint reminders, a revision-checked shared-memory writer, and a project-memory writer for sub-workspace sessions.",
+  "version": "1.0.3",
+  "description": "Auditable automatic memory infrastructure for DeepSeek Harness: turn-end checkpoint reminders, a revision-checked shared-memory writer, a project-memory writer for sub-workspace sessions, and a session-scoped workspace-grant that authorizes the parent project root.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -15,7 +15,9 @@
     "./checkpoint/locale/*.json": "./locale/checkpoint/*.json",
     "./checkpoint/icon": "./icon-checkpoint.svg",
     "./writer/locale/*.json": "./locale/writer/*.json",
-    "./writer/icon": "./icon-writer.svg"
+    "./writer/icon": "./icon-writer.svg",
+    "./workspace-grant": "./workspace-grant-entry.js",
+    "./workspace-grant/locale/*.json": "./locale/workspace-grant/*.json"
   },
   "files": [
     "index.js",
@@ -32,7 +34,10 @@
     "project-memory-store.mjs",
     "project-memory-tool.mjs",
     "project-writer-entry.js",
-    "icon-project-writer.svg"
+    "icon-project-writer.svg",
+    "workspace-grant.mjs",
+    "workspace-grant-entry.js",
+    "test-workspace-grant.mjs"
   ],
   "license": "MIT",
   "keywords": [

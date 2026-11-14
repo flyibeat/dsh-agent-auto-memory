@@ -1,4 +1,4 @@
-# One package, two independently switchable Host capabilities.
+# One package, four independently switchable Host capabilities.
 - insert:
     - id: agent-auto-memory-checkpoint
       name: 'dsh-agent-auto-memory/checkpoint'
@@ -6,3 +6,5 @@
       name: 'dsh-agent-auto-memory/writer'
     - id: agent-auto-memory-project-writer
       name: 'dsh-agent-auto-memory/project-writer'
+    - id: agent-auto-memory-workspace-grant
+      name: 'dsh-agent-auto-memory/workspace-grant'
