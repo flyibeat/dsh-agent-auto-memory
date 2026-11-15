@@ -34,6 +34,10 @@ Bundle 安装三个 Cordis 插件行，可在插件管理器分别启停：
 
 第 3 条优先于第 4 条：用错通道是硬错误（会撞沙箱拒绝或白费一次审批），必须在同一轮点破；「该不该沉淀」是判断题，可以温和提醒。
 
+**判据 3 看的是「写入目标」，不是「文本里出现过记忆路径」。** 只有解析出的写入目标（`>` / `>>` 的重定向对象、`Set-Content -Path`、`cp`/`mv` 的目的地、`rm`/`mkdir`/`touch` 的操作数、Python `open(path,'w')` 的路径）本身落在记忆路径上才提醒。否则
+`echo "见 ~/.agents/topics/x.md" > /dev/null`、`grep foo ~/.agents/topics/a.md > /tmp/o.txt`、
+`cp ~/.agents/topics/a.md D:/work/backup.md` 这些都会误报——误报多了提醒就会被忽略，正好抵消检测的意义。解析不出目标时保守放行（宁可多提醒一次，也不漏掉真实直写）。
+
 标记文件 `$DSH_HOME/logs/agent-auto-memory-checkpoint-last.json` 仍会写，但只作审计与统计，**不再作为闸门**。
 
 ## 安全写入能力

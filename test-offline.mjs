@@ -203,6 +203,47 @@ console.log('\n=== 10. v2：纯读取记忆路径 → 不误报强提醒 ===');
   }
 }
 
+console.log('\n=== 10b. v2：写入目标不是记忆路径 → 不误报（路径只出现在文本里）===');
+{
+  const cases = [
+    // 实测踩到的误报：路径只出现在 echo 的字符串里，重定向目标是 /dev/null
+    ['ops_bash', { command: 'echo probe > /dev/null; echo "只在注释里提到 ~/.agents/topics/probe.md"' }],
+    // grep 结果重定向到临时文件
+    ['ops_bash', { command: 'grep -n foo ~/.agents/topics/a.md > /tmp/o.txt' }],
+    // 读记忆文件后 tee 到别处
+    ['ops_bash', { command: 'cat ~/.agents/AGENTS.md | tee /tmp/copy.txt' }],
+    // 把记忆文件复制到工作区（目标是工作区，不是记忆根）
+    ['ops_bash', { command: 'cp ~/.agents/topics/a.md D:/work/backup.md' }],
+  ];
+  for (const [tool, args] of cases) {
+    resetHome('fp-' + Math.random()); const ctx = makeCtx(); mod.apply(ctx, {});
+    await ctx.emit('session/event', { id: 's' }, { type: 'turn/start' });
+    await callTool(ctx, 's', tool, args);
+    await ctx.emit('agent/turn-stopping', { agent: mkAgent(ctx, 's'), turn: 1 });
+    check(`${String(args.command).slice(0, 38)}… 未误报`,
+      ctx._steers.length === 1 && !textOf(ctx._steers[0]).includes('通道检查'));
+  }
+}
+
+console.log('\n=== 10c. v2：写入目标确实是记忆路径 → 强提醒（反向确认没漏）===');
+{
+  const cases = [
+    ['ops_bash', { command: 'echo x > ~/.agents/topics/a.md' }],
+    ['ops_bash', { command: 'grep -n foo src.md >> ~/.agents/AGENTS.md' }],
+    ['ops_bash', { command: 'cp /tmp/new.md ~/.agents/topics/a.md' }],
+    ['pwsh', { command: 'Set-Content -Path ~/.agents/topics/a.md -Value x' }],
+    ['ops_bash', { command: 'rm ~/.agents/topics/a.md' }],
+  ];
+  for (const [tool, args] of cases) {
+    resetHome('tp-' + Math.random()); const ctx = makeCtx(); mod.apply(ctx, {});
+    await ctx.emit('session/event', { id: 's' }, { type: 'turn/start' });
+    await callTool(ctx, 's', tool, args);
+    await ctx.emit('agent/turn-stopping', { agent: mkAgent(ctx, 's'), turn: 1 });
+    check(`${String(args.command).slice(0, 38)}… 命中强提醒`,
+      ctx._steers.length === 1 && textOf(ctx._steers[0]).includes('通道检查'));
+  }
+}
+
 console.log('\n=== 11. v2：命令碰无关路径 → 常规提醒 ===');
 {
   resetHome('unrel'); const ctx = makeCtx(); mod.apply(ctx, {});
@@ -281,7 +322,12 @@ console.log('\n=== 18. 标记文件位置与内容（仅审计，非闸门）===
   check('标记文件存在', fs.existsSync(mf));
   if (fs.existsSync(mf)) {
     const j = JSON.parse(fs.readFileSync(mf, 'utf8'));
-    check('日期是今天', j.date === new Date().toISOString().slice(0, 10));
+    // 插件按「本地日历」写日期；这里必须同样取本地日期，
+    // 用 toISOString() 会得到 UTC 日期，在东八区 00:00–08:00 之间差一天。
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    const localToday = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    check('日期是今天（本地日历）', j.date === localToday);
     check('含时间戳', typeof j.at === 'string');
     check('含 kind', j.kind === 'remind' || j.kind === 'suspicious');
   }

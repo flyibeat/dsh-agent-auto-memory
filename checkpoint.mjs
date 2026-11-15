@@ -97,6 +97,80 @@ const WRITE_HINT_RE = new RegExp(
   'i',
 );
 
+/**
+ * 从命令文本里提取「真正会被写入的路径」。
+ *
+ * 为什么不能只看「文本里出现过记忆路径」：`echo "见 ~/.agents/topics/x.md" > /dev/null`
+ * 和 `grep -n foo ~/.agents/topics/x.md > /tmp/o.txt` 都会同时命中「路径特征 + 重定向」，
+ * 但它们的写入目标是 /dev/null 与 /tmp/o.txt。误报多了，提醒就会被忽略——
+ * 那正好抵消这个检测存在的意义。所以按目标而不是按出现位置判定。
+ */
+function writeTargets(text) {
+  const out = [];
+  const push = (p) => {
+    if (!p) return;
+    const clean = String(p).trim().replace(/^["'`]|["'`]$/g, '');
+    if (clean) out.push(clean);
+  };
+
+  // 重定向目标：> X / >> X（排除 2>&1 这类 fd 复制）
+  for (const m of text.matchAll(/>>?\s*([^\s;&|)"'`]+)/g)) {
+    const t = m[1];
+    if (/^&\d+$/.test(t)) continue;
+    push(t);
+  }
+
+  // PowerShell 写文件 cmdlet 的目标
+  for (const m of text.matchAll(
+    /(?:Set-Content|Out-File|Add-Content|New-Item|Copy-Item|Move-Item|Remove-Item)\b([^;&|]*)/gi,
+  )) {
+    const seg = m[1];
+    const named = seg.match(/-Path\s+("[^"]+"|'[^']+'|\S+)/i);
+    if (named) push(named[1]);
+    else {
+      const pos = seg.trim().split(/\s+/).filter((x) => x && !x.startsWith('-'));
+      if (pos.length) push(pos[0]);
+    }
+  }
+
+  // cp / mv / copy / move：目标取最后一个非选项参数
+  for (const m of text.matchAll(/\b(?:cp|mv|copy|move|robocopy)\b([^;&|]*)/gi)) {
+    const parts = m[1].trim().split(/\s+/).filter((x) => x && !x.startsWith('-'));
+    if (parts.length) push(parts[parts.length - 1]);
+  }
+
+  // Python 写模式 open('path', 'w')
+  for (const m of text.matchAll(/open\s*\(\s*["']([^"']+)["']\s*,\s*["'][wax]/g)) {
+    push(m[1]);
+  }
+
+  // 目录类命令：rm -rf X / mkdir X / touch X
+  for (const m of text.matchAll(/\b(?:rm|mkdir|touch|del|rmdir)\b([^;&|]*)/gi)) {
+    const parts = m[1].trim().split(/\s+/).filter((x) => x && !x.startsWith('-'));
+    for (const p of parts) push(p);
+  }
+
+  return out;
+}
+
+/** 本轮是否「用命令通道写记忆文件」。 */
+function looksLikeMemoryWriteViaCommand(toolName, args) {
+  const n = String(toolName || '').toLowerCase();
+  if (!COMMAND_TOOLS.has(n)) return false;
+  const text = argText(args);
+  if (!text) return false;
+  if (!MEMORY_PATH_RE.test(text)) return false;
+  if (!WRITE_HINT_RE.test(text)) return false;
+
+  const targets = writeTargets(text);
+  if (targets.length > 0) {
+    // 有可解析的写入目标：只有目标本身落在记忆路径上才算
+    return targets.some((t) => MEMORY_PATH_RE.test(t));
+  }
+  // 解析不出目标时保守放行（宁可多提醒一次，也不漏掉真实直写）
+  return true;
+}
+
 function todayStr() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, '0');
@@ -147,16 +221,6 @@ function argText(args) {
   } catch {
     return '';
   }
-}
-
-/** 本轮是否「用命令通道碰了记忆文件且看起来在写」。 */
-function looksLikeMemoryWriteViaCommand(toolName, args) {
-  const n = String(toolName || '').toLowerCase();
-  if (!COMMAND_TOOLS.has(n)) return false;
-  const text = argText(args);
-  if (!text) return false;
-  if (!MEMORY_PATH_RE.test(text)) return false;
-  return WRITE_HINT_RE.test(text);
 }
 
 export function applyCheckpoint(ctx, config = {}) {
