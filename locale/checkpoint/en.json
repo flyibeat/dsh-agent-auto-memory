@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Automatic memory checkpoint",
-    "description": "Reminds the Agent at turn end when durable conclusions may still need to be saved."
+    "description": "Checks at the end of every turn whether durable memory may still need saving, and flags command-channel writes to memory files so the dedicated tools get used instead."
   }
 }

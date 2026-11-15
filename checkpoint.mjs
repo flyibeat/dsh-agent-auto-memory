@@ -5,17 +5,27 @@
  * 且其依赖的 dsh-hook-protocol 从未进入内核，所以 ~/.dsh/hooks.json 不会被读取。
  * 本插件改用 DSH 原生扩展点 agent/turn-stopping 实现同样的「轮末提醒」。
  *
- * 语义（照抄原钩子的四条判据，宁可少打扰）：
- *   1. 今天已提示过        → 静默
- *   2. 本轮有「改变状态」的
- *      工具调用，且今天
- *      还没提示过          → steer 提示一次并刷新标记
- *   3. 本轮无此类工具活动  → 静默（纯问答/只读不打扰）
- *   4. 任何异常            → 静默放行（绝不因为质检失败而打断对话）
+ * ===== 语义 v2（2026-11-15 改为「方案 C」）=====
+ * v1 的判据是「全局一天提示一次」，标记文件不带 sessionId：
+ * 任何一个会话用掉当天额度，其余会话当天全部静默。实测事故——23:31 在会话 A
+ * 用 bash+提权写记忆，因 12:40 会话 B 已用掉额度而全程无提醒。
  *
- * 工具名来源（两路并用）：
- *   - `tools/pre-execute` 的 `exec.name`：只覆盖模型直接发起的顶层工具调用；
- *   - `session/event` 的 `tool/call` / `tool/ptc-dispatch` 的 `data.name`：
+ * v2 改为「每会话每轮判定」，判据按顺序：
+ *   1. 本轮没有任何「改变状态」的工具调用        → 静默（纯问答不打扰）
+ *   2. 本轮已调用 write_shared_memory /
+ *      write_project_memory                    → 静默（已尽责，不打扰）
+ *   3. 本轮用 bash/pwsh/python 等命令碰了
+ *      .agents / topics / AGENTS.md 路径        → 强提醒「换专用工具，零提权」
+ *   4. 其余「干了活但没写记忆」                  → 常规提醒一次
+ *   5. 同一 (会话, 轮次) 只提醒一次              → 防重入
+ *   6. 任何异常                                  → 静默放行（绝不打断对话）
+ *
+ * 为什么 3 优先于 4：用错通道是硬错误（会触发沙箱拒绝或白费一次审批），
+ * 必须在同一轮就点破；而「该不该沉淀」是判断题，可以温和提醒。
+ *
+ * 工具名与参数来源（两路并用）：
+ *   - `tools/pre-execute` 的 exec.name：只覆盖模型直接发起的顶层工具调用；
+ *   - `session/event` 的 `tool/call` / `tool/ptc-dispatch` 的 data.name / data.arguments：
  *     PTC 模式下嵌套工具由 dsh-ops 自己的执行层派发，不经过 dsh-tools 的
  *     `prepare()`，`tools/pre-execute` 不会触发，只靠它会漏判。
  *   （`tool/result` 里只有 `source.callId`，拿不到工具名，不能用作判据。）
@@ -27,7 +37,7 @@ import path from 'node:path';
 
 const NS = 'agent-auto-memory-checkpoint';
 
-/** 默认提示语：只在「该沉淀却没沉淀」时出现一次。 */
+/** 常规提醒：只在「该沉淀却没沉淀」时出现。 */
 const DEFAULT_REASON =
   '记忆沉淀检查：先判断本轮是否产生了值得沉淀的内容——通用习惯与偏好、可复用的知识点或做法、' +
   '踩过的坑、被用户纠正的判断、用户说「记住」的结论、被推翻的旧事实。有则落盘；确实没有，' +
@@ -38,16 +48,54 @@ const DEFAULT_REASON =
   '项目根（AGENTS.md、.agents/topics/*.md）用 write_project_memory（若可用），两者都零提权；' +
   '禁止 bash/python 直写、禁止提权，判据是目标路径形态而不是手顺。';
 
+/** 强提醒：检测到本轮用命令通道碰了记忆文件。 */
+const SUSPICIOUS_REASON =
+  '通道检查（硬错误）：本轮你在 bash/pwsh/python 命令里碰了记忆文件路径（.agents / topics / AGENTS.md）。\n\n' +
+  '写记忆**不要**走命令通道：\n' +
+  '- `$DSH_AGENTS_HOME/AGENTS.md`、`topics/<单个>.md` → `write_shared_memory`\n' +
+  '- `<项目根>/AGENTS.md`、`<项目根>/.agents/topics/<单个>.md` → `write_project_memory`\n' +
+  '- 两者都在宿主进程里直接调 Node fs，**不参与沙箱可写根判定，零提权、不弹审批**。\n\n' +
+  '用 bash/python 直写会撞上 `PermissionError` / `file access denied`，再去提权会被审批拦下，' +
+  '而且 Windows 子进程根本不吃额外可写根。\n\n' +
+  '如果刚才那条命令确实只是**读**这些路径（grep/cat/ls/stat），忽略本提醒即可；' +
+  '如果是写，请立刻改用上面的专用工具重做，别把「我的脚本失败了」当成「文件写不了」。';
+
 /**
  * 会改变外部状态的工具 = 「干了活」。
  * 纯读取（read/grep/glob/ls）刻意不算：读一圈但没结论的轮次不该被催着写记忆。
  */
 const MUTATING_TOOLS = new Set([
   'write', 'edit', 'create', 'delete', 'move', 'copy', 'rename',
-  'bash', 'ops_bash', 'shell', 'exec', 'run',
+  'bash', 'ops_bash', 'shell', 'exec', 'run', 'pwsh', 'powershell',
   'apply_patch', 'str_replace', 'multi_edit', 'patch',
   'notebook_edit', 'update_file',
 ]);
+
+/** 走命令通道的工具：需要检查参数里有没有碰记忆文件。 */
+const COMMAND_TOOLS = new Set([
+  'bash', 'ops_bash', 'shell', 'exec', 'run', 'pwsh', 'powershell',
+]);
+
+/** 记忆写入专用工具：调用了就说明已尽责。 */
+const MEMORY_TOOLS = new Set(['write_shared_memory', 'write_project_memory']);
+
+/** 记忆文件路径特征。 */
+const MEMORY_PATH_RE = /(\.agents[\\/]|\.agents\b|topics[\\/]|AGENTS\.md)/i;
+
+/** 命令里的写意图特征（读操作不会命中，避免误报）。 */
+const WRITE_HINT_RE = new RegExp(
+  [
+    '>>?\\s*\\S',                       // 重定向
+    'Set-Content', 'Out-File', 'Add-Content',
+    'write_text', 'write_bytes', 'writelines', '\\.write\\s*\\(',
+    'open\\s*\\([^)]*[\'"][wax]',        // open(..., 'w')
+    '\\bcp\\b', '\\bmv\\b', '\\brm\\b', '\\bmkdir\\b', '\\btouch\\b',
+    'Remove-Item', 'Move-Item', 'Copy-Item', 'New-Item',
+    '\\btee\\b', '\\bdd\\b',
+    'os\\.rename', 'shutil\\.', 'os\\.remove',
+  ].join('|'),
+  'i',
+);
 
 function todayStr() {
   const d = new Date();
@@ -55,38 +103,24 @@ function todayStr() {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
-/** 标记文件：<DSH_HOME>/logs/agent-auto-memory-checkpoint-last.json */
+/** 标记文件（仅作审计/统计用，不再是「一天一次」的闸门）。 */
 function markerPaths() {
   const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
   const dir = path.join(home, 'logs');
   return {
     dir,
     file: path.join(dir, 'agent-auto-memory-checkpoint-last.json'),
-    legacy: path.join(dir, 'memory-checkpoint-last.json'),
   };
 }
 
-function alreadyPromptedToday() {
-  try {
-    const { file, legacy } = markerPaths();
-    for (const candidate of [file, legacy]) {
-      if (!fs.existsSync(candidate)) continue;
-      const j = JSON.parse(fs.readFileSync(candidate, 'utf8'));
-      if (String(j?.date || '') === todayStr()) return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-function markPrompted() {
+/** 记一条审计痕迹；失败不影响功能。 */
+function markPrompted(kind) {
   try {
     const { dir, file } = markerPaths();
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(
       file,
-      JSON.stringify({ date: todayStr(), at: new Date().toISOString() }, null, 2),
+      JSON.stringify({ date: todayStr(), at: new Date().toISOString(), kind }, null, 2),
       'utf8',
     );
     return true;
@@ -104,40 +138,87 @@ function isMutating(toolName) {
   return /(^|[_-])(write|edit|create|delete|remove|move|copy|patch|exec|bash|shell|run)([_-]|$)/.test(n);
 }
 
+/** 参数统一成可检索的文本。 */
+function argText(args) {
+  if (args == null) return '';
+  if (typeof args === 'string') return args;
+  try {
+    return JSON.stringify(args);
+  } catch {
+    return '';
+  }
+}
+
+/** 本轮是否「用命令通道碰了记忆文件且看起来在写」。 */
+function looksLikeMemoryWriteViaCommand(toolName, args) {
+  const n = String(toolName || '').toLowerCase();
+  if (!COMMAND_TOOLS.has(n)) return false;
+  const text = argText(args);
+  if (!text) return false;
+  if (!MEMORY_PATH_RE.test(text)) return false;
+  return WRITE_HINT_RE.test(text);
+}
+
 export function applyCheckpoint(ctx, config = {}) {
   const reason = config.reason || DEFAULT_REASON;
+  const suspiciousReason = config.suspiciousReason || SUSPICIOUS_REASON;
   const enabled = config.enabled !== false;
+  const detectSuspicious = config.detectSuspicious !== false;
 
   if (!enabled) {
     ctx.logger?.debug?.(`[${NS}] disabled by config`);
     return;
   }
 
-  /** sessionId -> 本轮是否出现过写类工具调用 */
-  const sawMutation = new Map();
+  /** sessionId -> { sawMutation, wroteMemory, suspiciousWrite } */
+  const state = new Map();
+  /** `${sessionId}#${turn}` 已提醒过的集合，防重入 */
+  const reminded = new Set();
 
-  // 判据来源：per-tool 的 exec.name（唯一能拿到工具名的地方）
+  const ensure = (sid) => {
+    let st = state.get(sid);
+    if (!st) {
+      st = { sawMutation: false, wroteMemory: false, suspiciousWrite: false };
+      state.set(sid, st);
+    }
+    return st;
+  };
+
+  /** 统一的「观察一次工具调用」。 */
+  const observe = (sid, toolName, args) => {
+    if (!sid || !toolName) return;
+    const st = ensure(sid);
+    const n = String(toolName).toLowerCase();
+    if (isMutating(toolName)) st.sawMutation = true;
+    if (MEMORY_TOOLS.has(n)) st.wroteMemory = true;
+    if (detectSuspicious && looksLikeMemoryWriteViaCommand(toolName, args)) {
+      st.suspiciousWrite = true;
+    }
+  };
+
+  // 顶层工具调用（能拿到 name + arguments）
   ctx.on('tools/pre-execute', async (exec, next) => {
     try {
-      const sid = exec?.agent?.session?.id;
-      if (sid && isMutating(exec?.name)) sawMutation.set(sid, true);
+      observe(exec?.agent?.session?.id, exec?.name, exec?.arguments);
     } catch {
       /* 静默：质检不能影响工具执行 */
     }
     return next(); // 这是 waterfall，必须放行
   });
 
-  // 轮次开始 → 重置本轮的「干过活」状态
+  // 会话事件：轮次开始重置状态；PTC 嵌套工具从事件里取 name + arguments
   ctx.on('session/event', (session, event) => {
     try {
       if (!session?.id) return;
       if (event?.type === 'turn/start') {
-        sawMutation.set(session.id, false);
+        const st = ensure(session.id);
+        st.sawMutation = false;
+        st.wroteMemory = false;
+        st.suspiciousWrite = false;
         return;
       }
-      // PTC 嵌套工具走不到 tools/pre-execute，只能从会话事件里取工具名
       if (event?.type === 'tool/call' || event?.type === 'tool/ptc-dispatch') {
-        if (isMutating(event?.data?.name)) sawMutation.set(session.id, true);
+        observe(session.id, event?.data?.name, event?.data?.arguments);
       }
     } catch {
       /* 静默 */
@@ -146,7 +227,12 @@ export function applyCheckpoint(ctx, config = {}) {
 
   ctx.on('session/disposed', (session) => {
     try {
-      if (session?.id) sawMutation.delete(session.id);
+      if (session?.id) {
+        state.delete(session.id);
+        for (const k of reminded) {
+          if (k.startsWith(`${session.id}#`)) reminded.delete(k);
+        }
+      }
     } catch {
       /* 静默 */
     }
@@ -158,25 +244,41 @@ export function applyCheckpoint(ctx, config = {}) {
       const sid = agent?.session?.id;
       if (!sid) return;
 
-      if (sawMutation.get(sid) !== true) return; // 判据 3：没干活不打扰
-      if (alreadyPromptedToday()) return;        // 判据 1：今天已提示过
-      ctx.logger?.info?.(`[${NS}] turn-stopping: reminding once (turn=${turn})`);
+      const st = state.get(sid);
+      if (!st) return;
+      if (st.sawMutation !== true) return;   // 判据 1：没干活不打扰
+      if (st.wroteMemory === true) return;   // 判据 2：已用专用工具写过
+
+      const key = `${sid}#${turn}`;
+      if (reminded.has(key)) return;         // 判据 5：同轮只提醒一次
+
+      let text;
+      let kind;
+      if (st.suspiciousWrite === true) {     // 判据 3：用错通道，硬错误
+        text = suspiciousReason;
+        kind = 'suspicious';
+      } else {                               // 判据 4：干了活但没写记忆
+        text = reason;
+        kind = 'remind';
+      }
+
+      reminded.add(key);
+      ctx.logger?.info?.(`[${NS}] turn-stopping: ${kind} (turn=${turn})`);
       // steer 契约是完整 UserMessage：v4 读取端 assertMessageEventShape 要求
       // id（非空串）、role:'user'、source 对象、content 数组，缺一即判会话 corrupt。
       // 官方 createUserMessage 会自动补 id/role；插件拿不到该内部 API，必须自建全字段。
       await agent.steer({
         id: randomUUID(),
         role: 'user',
-        content: [{ type: 'text', text: reason }],
+        content: [{ type: 'text', text }],
         source: { kind: NS },
       });
-      // 标记必须写在 steer 成功之后：先写会让「注入失败」也耗掉当天额度，用户再也收不到提醒
-      if (!markPrompted()) ctx.logger?.warn?.(`[${NS}] markPrompted failed after steer`);
+      markPrompted(kind);
     } catch (error) {
-      // 判据 4：任何异常静默放行，绝不打断对话
+      // 判据 6：任何异常静默放行，绝不打断对话
       ctx.logger?.warn?.(`[${NS}] turn-stopping check failed: ${String(error)}`);
     }
   });
 
-  ctx.logger?.info?.(`[${NS}] loaded`);
+  ctx.logger?.info?.(`[${NS}] loaded (v2: per-turn, suspicious-channel detection)`);
 }

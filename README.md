@@ -15,7 +15,7 @@ Bundle 安装三个 Cordis 插件行，可在插件管理器分别启停：
 
 | 行 ID | 能力 | 默认 |
 |---|---|---|
-| `agent-auto-memory-checkpoint` | 在 `agent/turn-stopping` 检查本轮是否可能漏写记忆，必要时 steer 提醒 | 开 |
+| `agent-auto-memory-checkpoint` | 在 `agent/turn-stopping` 逐轮检查是否可能漏写记忆，或是否用命令通道直写了记忆文件，必要时 steer 提醒 | 开 |
 | `agent-auto-memory-writer` | 注册 `write_shared_memory`，只写共享 Agent 记忆根 | 开 |
 | `agent-auto-memory-project-writer` | 注册 `write_project_memory`，写会话所属项目的 `AGENTS.md` 与 `.agents/topics/` | 开 |
 
@@ -23,9 +23,18 @@ Bundle 安装三个 Cordis 插件行，可在插件管理器分别启停：
 
 ## 轮末检查能力
 
-它只在本轮发生写/编辑/命令等改变状态的工具调用、且今天尚未提醒时 steer 一次。纯问答和只读轮次静默；任何提醒异常均放行，不影响正常对话。
+**逐轮判定，不再「全局一天一次」。** v1.0.x 的标记文件不带 sessionId，任何一个会话用掉当天额度后，其余会话当天全部静默——多会话场景下会整轮漏提醒。v1.1.0 起改为按 (会话, 轮次) 判定，判据按顺序：
 
-标记文件：`$DSH_HOME/logs/agent-auto-memory-checkpoint-last.json`。
+1. 本轮没有任何改变状态的工具调用 → 静默（纯问答、只读轮次不打扰）。
+2. 本轮已调用 `write_shared_memory` / `write_project_memory` → 静默（已尽责）。
+3. 本轮在 `bash` / `pwsh` / `python` 等命令里碰了 `.agents`、`topics/`、`AGENTS.md` **且带写意图** → **强提醒**：立刻改用专用工具，别用命令通道直写、别提权。
+4. 其余「干了活但没写记忆」→ 常规提醒一次。
+5. 同一 (会话, 轮次) 只提醒一次，防重入。
+6. 任何提醒异常均放行，不影响正常对话。
+
+第 3 条优先于第 4 条：用错通道是硬错误（会撞沙箱拒绝或白费一次审批），必须在同一轮点破；「该不该沉淀」是判断题，可以温和提醒。
+
+标记文件 `$DSH_HOME/logs/agent-auto-memory-checkpoint-last.json` 仍会写，但只作审计与统计，**不再作为闸门**。
 
 ## 安全写入能力
 
@@ -70,12 +79,20 @@ Bundle 安装三个 Cordis 插件行，可在插件管理器分别启停：
   config:
     enabled: true
     reason: "可选的自定义提醒文本"
+    suspiciousReason: "可选：检测到命令通道直写记忆文件时的提醒文本"
+    detectSuspicious: true   # 关掉则只保留「干了活但没写记忆」的常规提醒
 ```
 
 默认提醒语的判据是**本轮是否产生了值得沉淀的内容**（通用习惯、可复用做法、踩过的坑、被纠正的判断、
 用户说「记住」、被推翻的旧事实），没有就回「本轮无新记忆」。它**不写死技能名**，只按 description
 指代「自动记忆 / 记忆沉淀 / 记忆分流」类技能——技能改名不影响对应关系；并顺带给出工具判据
 （共享根 → `write_shared_memory`，项目根 → `write_project_memory`，都零提权；禁止直写与提权）。
+
+`suspiciousReason` 是另一条独立文案，专门对付「用 `bash`/`pwsh`/`python` 去写 `~/.agents/**` 或
+`.agents/topics/**`」这类硬错误：它会在同一轮就点破通道选错，并说明用命令通道会撞 `PermissionError`
+/ `file access denied`、提权会被审批拦下、Windows 子进程不吃额外可写根。检测只看命令工具的参数里
+是否同时出现记忆路径特征与写意图特征（重定向、`Set-Content`、`open(...,'w')`、`cp`/`mv`/`rm` 等），
+纯读取（`grep`/`cat`/`ls`/`stat`）不会误报。
 
 ### 自定义 writer 工具名
 
