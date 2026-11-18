@@ -51,20 +51,37 @@ function mkAgent(ctx, sessionId) {
   };
 }
 
-/** 模拟一次顶层工具调用（走 tools/pre-execute waterfall） */
+let callSequence = 0;
+
+/** 模拟原生工具调用起点：pre-execute + durable tool/call。 */
 async function callTool(ctx, sid, toolName, args = {}) {
-  const exec = { name: toolName, arguments: args, agent: { session: { id: sid } } };
+  const callId = 'call-' + (++callSequence);
+  const exec = { callId, name: toolName, arguments: args, agent: { session: { id: sid } } };
   const next = async () => ({ ok: true });
   const list = ctx._handlers.get('tools/pre-execute') || [];
   for (const fn of list) await fn(exec, next);
+  await ctx.emit('session/event', { id: sid }, {
+    type: 'tool/call', data: { callId, name: toolName, arguments: args },
+  });
+  return callId;
 }
 
-/** 模拟一次 PTC 派发（走 session/event，绕过 tools/pre-execute） */
-async function ptcDispatch(ctx, sid, toolName, args = {}) {
+/** 模拟原生工具 settled result。 */
+async function settleTool(ctx, sid, callId, isError = false) {
+  await ctx.emit('session/event', { id: sid }, {
+    type: 'tool/result',
+    data: { message: { content: [{ type: 'tool-result', toolCallId: callId, isError }] } },
+  });
+}
+
+/** 模拟一次已 settled 的 PTC 派发。 */
+async function ptcDispatch(ctx, sid, toolName, args = {}, isError = false) {
+  const subCallId = 'ptc-' + (++callSequence);
   await ctx.emit('session/event', { id: sid }, {
     type: 'tool/ptc-dispatch',
-    data: { name: toolName, arguments: args },
+    data: { subCallId, name: toolName, arguments: args, isError },
   });
+  return subCallId;
 }
 
 function resetHome(tag) {
@@ -154,16 +171,33 @@ console.log('\n=== 7. v2：逐轮判定，不再「全局一天一次」 ===');
   check('另一会话同一天也提醒（旧版这里会静默）', ctx._steers.length === 3);
 }
 
-console.log('\n=== 8. v2：已用专用工具写过记忆 → 静默 ===');
+console.log('\n=== 8. v3：专用工具成功落盘后才静默 ===');
 {
-  for (const t of ['write_shared_memory', 'write_project_memory']) {
+  for (const t of ['write_shared_memory', 'write_shared_memory_pair', 'write_project_memory']) {
     resetHome('mem-' + t); const ctx = makeCtx(); mod.apply(ctx, {});
     await ctx.emit('session/event', { id: 's' }, { type: 'turn/start' });
     await callTool(ctx, 's', 'write', { file_path: 'a.md' });
-    await callTool(ctx, 's', t, { path: 'AGENTS.md', content: 'x', expectedRevision: 'absent' });
+    const callId = await callTool(ctx, 's', t, { path: 'AGENTS.md', content: 'x', expectedRevision: 'absent' });
+    await settleTool(ctx, 's', callId, false);
     await ctx.emit('agent/turn-stopping', { agent: mkAgent(ctx, 's'), turn: 1 });
-    check(`${t} 已调用 → 不打扰`, ctx._steers.length === 0);
+    check(t + ' 成功 → 不打扰', ctx._steers.length === 0);
   }
+}
+
+console.log('\n=== 8b. v3：专用工具失败不能冒充已沉淀 ===');
+{
+  resetHome('mem-failed'); const ctx = makeCtx(); mod.apply(ctx, {});
+  await ctx.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  const failed = await callTool(ctx, 's', 'write_shared_memory', { path: '../bad.md', content: 'x', expectedRevision: 'absent' });
+  await settleTool(ctx, 's', failed, true);
+  await ctx.emit('agent/turn-stopping', { agent: mkAgent(ctx, 's'), turn: 1 });
+  check('原生 memory result 失败 → 仍提醒', ctx._steers.length === 1 && textOf(ctx._steers[0]).includes('记忆沉淀检查'));
+
+  resetHome('ptc-mem-failed'); const ptc = makeCtx(); mod.apply(ptc, {});
+  await ptc.emit('session/event', { id: 'p' }, { type: 'turn/start' });
+  await ptcDispatch(ptc, 'p', 'write_project_memory', { path: 'AGENTS.md' }, true);
+  await ptc.emit('agent/turn-stopping', { agent: mkAgent(ptc, 'p'), turn: 1 });
+  check('PTC memory dispatch 失败 → 仍提醒', ptc._steers.length === 1 && textOf(ptc._steers[0]).includes('记忆沉淀检查'));
 }
 
 console.log('\n=== 9. v2：命令通道直写记忆文件 → 强提醒 ===');

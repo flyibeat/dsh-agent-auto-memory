@@ -9,15 +9,16 @@ DeepSeek Harness（DSH）的自动记忆基础设施插件，与 Agent Skill `ag
 
 插件不总结对话，也不自行决定记什么；内容决策始终由 Agent 按 Skill 执行。
 
-## 一个包，三项独立能力
+## 一个包，四项独立能力
 
-Bundle 安装三个 Cordis 插件行，可在插件管理器分别启停：
+Bundle 安装四个 Cordis 插件行，可在插件管理器分别启停：
 
 | 行 ID | 能力 | 默认 |
 |---|---|---|
 | `agent-auto-memory-checkpoint` | 在 `agent/turn-stopping` 逐轮检查是否可能漏写记忆，或是否用命令通道直写了记忆文件，必要时 steer 提醒 | 开 |
 | `agent-auto-memory-writer` | 注册 `write_shared_memory`，只写共享 Agent 记忆根 | 开 |
 | `agent-auto-memory-project-writer` | 注册 `write_project_memory`，写会话所属项目的 `AGENTS.md` 与 `.agents/topics/` | 开 |
+| `agent-auto-memory-workspace-grant` | 按会话授权父项目根，让文件工具可写项目内其它文件 | 开 |
 
 也可在 profile patch 中按 ID 设置 `disabled: true`，互不影响。
 
@@ -26,7 +27,7 @@ Bundle 安装三个 Cordis 插件行，可在插件管理器分别启停：
 **逐轮判定，不再「全局一天一次」。** v1.0.x 的标记文件不带 sessionId，任何一个会话用掉当天额度后，其余会话当天全部静默——多会话场景下会整轮漏提醒。v1.1.0 起改为按 (会话, 轮次) 判定，判据按顺序：
 
 1. 本轮没有任何改变状态的工具调用 → 静默（纯问答、只读轮次不打扰）。
-2. 本轮已调用 `write_shared_memory` / `write_project_memory` → 静默（已尽责）。
+2. 本轮 `write_shared_memory` / `write_shared_memory_pair` / `write_project_memory` 的 settled 结果确认成功 → 静默；仅调用、revision conflict 或其它失败都不算已沉淀。
 3. 本轮在 `bash` / `pwsh` / `python` 等命令里碰了 `.agents`、`topics/`、`AGENTS.md` **且带写意图** → **强提醒**：立刻改用专用工具，别用命令通道直写、别提权。
 4. 其余「干了活但没写记忆」→ 常规提醒一次。
 5. 同一 (会话, 轮次) 只提醒一次，防重入。
@@ -49,16 +50,20 @@ Bundle 安装三个 Cordis 插件行，可在插件管理器分别启停：
 
 必传完整 UTF-8 内容和 `expectedRevision`（已读取的 SHA-256；**创建新文件时传字面量字符串 `"absent"`，不能省略该参数**——省略、空串、`null` 都会被拒为 `expectedRevision must be absent or a lowercase SHA-256`）。工具拒绝删除、移动、路径穿越、嵌套目录、Windows 保留名、非法字符、超过 1 MiB、符号链接/junction 和 revision 冲突。
 
-更新流程：临时目录备份 → 同目录独占临时文件 → flush/fsync → 再核对 revision 与真实目录 → 原子 rename。Host 内写入串行排队；同 revision 并发竞争最多一个成功。
+更新流程：同目录独占临时文件 → flush/fsync → 再核对 revision 与真实目录 → 把旧内容写入该目标唯一的 previous 槽位及来源元数据 → 原子 rename。每个目标只保留紧邻上一版，不再按时间戳无限累积；不同根和相对路径用哈希隔离。Host 内写入串行排队，同 revision 并发竞争最多一个成功。
 
 共享根按 `$DSH_AGENTS_HOME` 解析，默认 `~/.agents`。根目录必须在安装/迁移时预先创建，工具不会自行创建或扩大权限。
+
+### topic 与索引成对写入
+
+`write_shared_memory_pair` 一次接收一个 `topics/<单个>.md` 和配套的 `AGENTS.md` 完整内容及各自 revision。它先暂存并校验两份文件，再提交 topic 与索引；提交中断会按 transaction journal 恢复到两份旧 revision，避免 topic 已创建而索引缺失。普通单文件更新仍用 `write_shared_memory`。
 
 ## 项目记忆写入能力
 
 会话工作区常常是项目的子目录（例如 `项目/撰写/2026-11-08-某题`），此时沙箱可写根只有那个子目录，父项目的 `.agents/topics/` 在可写根之外，普通 `write` 一律 `file access denied`，提权又会走审批。工具 `write_project_memory` 补上这条路：
 
 - 从**会话工作区**（`exec.agent.session.header.cwd`，不是宿主进程 cwd）向上找最近的、含 `.agents` 或 `AGENTS.md` 的目录，**最多上溯 3 层**；找不到就报错并列出查过的目录，不静默回退到共享根。
-- 只接受 `AGENTS.md` 与 `.agents/topics/<单个安全 Markdown 文件名>.md`，同样必须带 `expectedRevision`（新建传 `"absent"`），同样的备份、原子替换、串行队列与链接拒绝。
+- 只接受 `AGENTS.md` 与 `.agents/topics/<单个安全 Markdown 文件名>.md`，同样必须带 `expectedRevision`（新建传 `"absent"`），同样使用每目标一个 previous 槽位、来源元数据、原子替换、串行队列与链接拒绝。
 - 越界防护：路径逃逸、嵌套目录、Windows 保留名、符号链接/junction、超过 1 MiB、revision 冲突一律拒绝。
 
 可配置（通常不需要）：
@@ -121,11 +126,11 @@ plugin_manager install_bundle <本地目录、tgz、npm spec 或 GitHub spec>
 
 ## 与记忆目录迁移的顺序
 
-1. 安装并确认两项插件行 active，工具目录可见 `write_shared_memory`。
+1. 安装并确认四项插件行 active，工具目录可见 `write_shared_memory`、`write_shared_memory_pair`、`write_project_memory`。
 2. 原子创建 `~/.agents/AGENTS.md` 与 `~/.agents/topics/`。
 3. 把 `~/.dsh/AGENTS.md` 缩减为受保护规则层；旧 `~/.dsh/topics` 暂留作回滚副本。
 4. 新会话验证两份根均自动注入。
-5. 用专用工具写共享 topic；普通文件/命令工具仍不能写保护层。
+5. 新建 topic 或同步更新索引时用 `write_shared_memory_pair`；单文件更新用对应专用工具；普通文件/命令工具仍不能写保护层。
 
 ## 开发验证
 
@@ -133,6 +138,7 @@ plugin_manager install_bundle <本地目录、tgz、npm spec 或 GitHub spec>
 node --check index.js
 node --check checkpoint.mjs
 node --check memory-tool.mjs
+node --check atomic-memory-store.mjs
 node --check memory-store.mjs
 node test-offline.mjs
 node test-writer.mjs

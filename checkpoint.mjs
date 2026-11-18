@@ -77,7 +77,7 @@ const COMMAND_TOOLS = new Set([
 ]);
 
 /** 记忆写入专用工具：调用了就说明已尽责。 */
-const MEMORY_TOOLS = new Set(['write_shared_memory', 'write_project_memory']);
+const MEMORY_TOOLS = new Set(['write_shared_memory', 'write_shared_memory_pair', 'write_project_memory']);
 
 /** 记忆文件路径特征。 */
 const MEMORY_PATH_RE = /(\.agents[\\/]|\.agents\b|topics[\\/]|AGENTS\.md)/i;
@@ -234,43 +234,52 @@ export function applyCheckpoint(ctx, config = {}) {
     return;
   }
 
-  /** sessionId -> { sawMutation, wroteMemory, suspiciousWrite } */
+  /** sessionId -> per-turn observation state. */
   const state = new Map();
-  /** `${sessionId}#${turn}` 已提醒过的集合，防重入 */
+  /** One reminder per session and turn, preventing steer re-entry. */
   const reminded = new Set();
 
   const ensure = (sid) => {
     let st = state.get(sid);
     if (!st) {
-      st = { sawMutation: false, wroteMemory: false, suspiciousWrite: false };
+      st = { sawMutation: false, wroteMemory: false, memoryWriteFailed: false, suspiciousWrite: false, pendingMemoryCalls: new Map() };
       state.set(sid, st);
     }
     return st;
   };
 
-  /** 统一的「观察一次工具调用」。 */
-  const observe = (sid, toolName, args) => {
+  /** Observe a call start. A memory attempt is work, but not success yet. */
+  const observeCall = (sid, toolName, args, callId) => {
     if (!sid || !toolName) return;
     const st = ensure(sid);
     const n = String(toolName).toLowerCase();
-    if (isMutating(toolName)) st.sawMutation = true;
-    if (MEMORY_TOOLS.has(n)) st.wroteMemory = true;
-    if (detectSuspicious && looksLikeMemoryWriteViaCommand(toolName, args)) {
-      st.suspiciousWrite = true;
-    }
+    if (isMutating(toolName) || MEMORY_TOOLS.has(n)) st.sawMutation = true;
+    if (MEMORY_TOOLS.has(n) && callId != null) st.pendingMemoryCalls.set(String(callId), n);
+    if (detectSuspicious && looksLikeMemoryWriteViaCommand(toolName, args)) st.suspiciousWrite = true;
   };
 
-  // 顶层工具调用（能拿到 name + arguments）
+  /** Mark memory complete only after the durable result says success. */
+  const observeMemoryResult = (sid, callId, isError) => {
+    if (!sid || callId == null) return;
+    const st = ensure(sid);
+    const key = String(callId);
+    if (!st.pendingMemoryCalls.has(key)) return;
+    st.pendingMemoryCalls.delete(key);
+    if (isError) st.memoryWriteFailed = true;
+    else st.wroteMemory = true;
+  };
+
+  // Top-level calls expose name, arguments, and callId before execution.
   ctx.on('tools/pre-execute', async (exec, next) => {
     try {
-      observe(exec?.agent?.session?.id, exec?.name, exec?.arguments);
+      observeCall(exec?.agent?.session?.id, exec?.name, exec?.arguments, exec?.callId);
     } catch {
-      /* 静默：质检不能影响工具执行 */
+      /* Quality checks must never block execution. */
     }
-    return next(); // 这是 waterfall，必须放行
+    return next();
   });
 
-  // 会话事件：轮次开始重置状态；PTC 嵌套工具从事件里取 name + arguments
+  // Native calls settle through tool/result; PTC subcalls settle in tool/ptc-dispatch.
   ctx.on('session/event', (session, event) => {
     try {
       if (!session?.id) return;
@@ -278,14 +287,27 @@ export function applyCheckpoint(ctx, config = {}) {
         const st = ensure(session.id);
         st.sawMutation = false;
         st.wroteMemory = false;
+        st.memoryWriteFailed = false;
         st.suspiciousWrite = false;
+        st.pendingMemoryCalls.clear();
         return;
       }
-      if (event?.type === 'tool/call' || event?.type === 'tool/ptc-dispatch') {
-        observe(session.id, event?.data?.name, event?.data?.arguments);
+      if (event?.type === 'tool/call') {
+        observeCall(session.id, event?.data?.name, event?.data?.arguments, event?.data?.callId);
+        return;
+      }
+      if (event?.type === 'tool/result') {
+        const block = event?.data?.message?.content?.find?.((item) => item?.type === 'tool-result');
+        observeMemoryResult(session.id, block?.toolCallId, block?.isError === true);
+        return;
+      }
+      if (event?.type === 'tool/ptc-dispatch') {
+        const callId = event?.data?.subCallId;
+        observeCall(session.id, event?.data?.name, event?.data?.arguments, callId);
+        observeMemoryResult(session.id, callId, event?.data?.isError === true);
       }
     } catch {
-      /* 静默 */
+      /* Silent by design. */
     }
   });
 
@@ -311,7 +333,7 @@ export function applyCheckpoint(ctx, config = {}) {
       const st = state.get(sid);
       if (!st) return;
       if (st.sawMutation !== true) return;   // 判据 1：没干活不打扰
-      if (st.wroteMemory === true) return;   // 判据 2：已用专用工具写过
+      if (st.wroteMemory === true) return;   // 判据 2：专用工具已成功落盘
 
       const key = `${sid}#${turn}`;
       if (reminded.has(key)) return;         // 判据 5：同轮只提醒一次

@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-auto-memory",
-  "version": "1.1.1",
-  "description": "Auditable automatic memory infrastructure for DeepSeek Harness: turn-end checkpoint reminders, a revision-checked shared-memory writer, a project-memory writer for sub-workspace sessions, and a session-scoped workspace-grant that authorizes the parent project root.",
+  "version": "1.2.0",
+  "description": "Auditable automatic memory infrastructure for DeepSeek Harness: result-aware turn-end checks, revision-checked single and paired memory writers, one previous version per target with provenance, and session-scoped project-root grants.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -26,6 +26,7 @@
     "checkpoint.mjs",
     "memory-tool.mjs",
     "memory-store.mjs",
+    "atomic-memory-store.mjs",
     "cordis.patch.yml",
     "README.md",
     "locale",

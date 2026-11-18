@@ -1,13 +1,13 @@
-import { createHash, randomUUID } from 'node:crypto'
-import { copyFile, lstat, mkdir, open, readFile, realpath, rename, chmod, unlink } from 'node:fs/promises'
-import { basename, dirname, join, resolve, sep } from 'node:path'
-import { tmpdir } from 'node:os'
+import { basename, join, resolve } from 'node:path'
+import {
+  atomicWriteAuxiliary, backupPrepared, commitPrepared, discardPrepared,
+  prepareAtomicMemoryWrite, readJsonIfPresent, removeIfPresent, restoreSnapshot,
+  revisionOf, snapshotPrepared, supportDirectory,
+} from './atomic-memory-store.mjs'
 
-const REVISION = /^[0-9a-f]{64}$/
 const TOPIC = /^topics[\/][^\/]+\.md$/u
 const INVALID_WINDOWS_NAME = /[\u0000-\u001f<>:"|?*]/u
 const RESERVED_WINDOWS_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu
-const MAX_CONTENT_BYTES = 1024 * 1024
 
 export function validateMemoryPath(relativePath) {
   if (relativePath === 'AGENTS.md') return relativePath
@@ -20,79 +20,100 @@ export function validateMemoryPath(relativePath) {
   return normalized
 }
 
-async function regularOrAbsent(path) {
-  try {
-    const stat = await lstat(path)
-    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('target must be a regular file, not a link')
-    return stat
-  } catch (error) {
-    if (error?.code === 'ENOENT') return undefined
-    throw error
+function optionsFor(root, relativePath, request) {
+  const physicalRoot = resolve(root)
+  const parentSegments = relativePath === 'AGENTS.md' ? [] : ['topics']
+  const expectedTarget = relativePath === 'AGENTS.md'
+    ? join(physicalRoot, 'AGENTS.md')
+    : join(physicalRoot, 'topics', basename(relativePath))
+  return {
+    root: physicalRoot,
+    rootLabel: 'shared memory root',
+    parentSegments,
+    parentLabel: relativePath === 'AGENTS.md' ? 'shared memory root' : 'topics directory',
+    relativePath,
+    expectedTarget,
+    request,
   }
 }
 
-async function assertPhysicalDirectory(path, label) {
-  const stat = await lstat(path)
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(label + ' must be an existing physical directory')
-  const physical = await realpath(path)
-  if (resolve(physical) !== resolve(path)) throw new Error(label + ' must not resolve through a link or junction')
+function journalPath(root) {
+  return join(supportDirectory(root), 'shared-pair-transaction.json')
 }
 
-export async function revisionOf(path) {
-  try {
-    return createHash('sha256').update(await readFile(path)).digest('hex')
-  } catch (error) {
-    if (error?.code === 'ENOENT') return 'absent'
-    throw error
+async function writeJournal(root, journal) {
+  await atomicWriteAuxiliary(journalPath(root), Buffer.from(JSON.stringify(journal, null, 2) + '\n', 'utf8'))
+}
+
+export async function recoverSharedMemoryPair(root) {
+  const file = journalPath(root)
+  const journal = await readJsonIfPresent(file)
+  if (!journal) return false
+  if (journal.version !== 1 || resolve(journal.root) !== resolve(root) || !journal.topic || !journal.index) {
+    throw new Error('invalid shared-memory transaction journal: ' + file)
   }
+  const topicCurrent = await revisionOf(journal.topic.target)
+  const indexCurrent = await revisionOf(journal.index.target)
+  const topicNew = topicCurrent === journal.topic.newRevision
+  const indexNew = indexCurrent === journal.index.newRevision
+  const topicOld = topicCurrent === journal.topic.previousRevision
+  const indexOld = indexCurrent === journal.index.previousRevision
+  if (topicNew && indexOld) await restoreSnapshot(journal.topic)
+  else if (topicOld && indexNew) await restoreSnapshot(journal.index)
+  else if (!(topicOld && indexOld) && !(topicNew && indexNew)) {
+    throw new Error('cannot recover shared-memory transaction with unexpected revisions')
+  }
+  await removeIfPresent(file)
+  return true
 }
 
 export async function writeSharedMemory(root, request) {
+  await recoverSharedMemoryPair(resolve(root))
   const relativePath = validateMemoryPath(request.path)
-  const expected = request.expectedRevision
-  if (expected !== 'absent' && !REVISION.test(expected)) throw new Error('expectedRevision must be absent or a lowercase SHA-256')
-  if (typeof request.content !== 'string') throw new Error('content must be a UTF-8 string')
-  if (Buffer.byteLength(request.content) > MAX_CONTENT_BYTES) throw new Error('content exceeds 1 MiB limit')
-  const physicalRoot = resolve(root)
-  await assertPhysicalDirectory(physicalRoot, 'shared memory root')
-  const parent = relativePath === 'AGENTS.md' ? physicalRoot : join(physicalRoot, 'topics')
-  if (relativePath !== 'AGENTS.md') {
-    await mkdir(parent, { recursive: true })
-    await assertPhysicalDirectory(parent, 'topics directory')
-  }
-  const target = resolve(physicalRoot, relativePath)
-  if (target !== join(physicalRoot, 'AGENTS.md') && dirname(target) !== join(physicalRoot, 'topics')) throw new Error('path escaped shared memory root')
-  const targetStat = await regularOrAbsent(target)
-  await assertPhysicalDirectory(physicalRoot, 'shared memory root')
-  await assertPhysicalDirectory(parent, relativePath === 'AGENTS.md' ? 'shared memory root' : 'topics directory')
-  const observed = await revisionOf(target)
-  if (observed !== expected) throw new Error('revision conflict: expected ' + expected + ', observed ' + observed)
-  const backupDir = join(tmpdir(), 'amem-backup')
-  await mkdir(backupDir, { recursive: true })
-  let backup
-  if (targetStat) {
-    backup = join(backupDir, basename(target) + '.bak-' + Date.now() + '-' + randomUUID())
-    await copyFile(target, backup)
-  }
-  const temporary = join(parent, '.amem-' + randomUUID() + '.tmp')
-  const handle = await open(temporary, 'wx', targetStat?.mode ?? 0o600)
-  try {
-    await handle.writeFile(request.content, { encoding: 'utf8' })
-    await handle.sync()
-  } finally {
-    await handle.close()
-  }
-  try {
-    if (targetStat) await chmod(temporary, targetStat.mode)
-    await assertPhysicalDirectory(physicalRoot, 'shared memory root')
-    await assertPhysicalDirectory(parent, relativePath === 'AGENTS.md' ? 'shared memory root' : 'topics directory')
-    const latest = await revisionOf(target)
-    if (latest !== expected) throw new Error('revision conflict before atomic replace: observed ' + latest)
-    await rename(temporary, target)
-  } catch (error) {
-    await unlink(temporary).catch(() => {})
-    throw error
-  }
-  const revision = await revisionOf(target)
-  return { path: relativePath, operation: expected === 'absent' ? 'create' : 'update', revision, bytes: Buffer.byteLength(request.content), lineCount: request.content.length === 0 ? 0 : request.content.split(/\n/).length, ...(backup ? { backup } : {}) }
+  const prepared = await prepareAtomicMemoryWrite(optionsFor(root, relativePath, request))
+  try { return await commitPrepared(prepared) } finally { await discardPrepared(prepared) }
 }
+
+export async function writeSharedMemoryPair(root, request) {
+  const physicalRoot = resolve(root)
+  await recoverSharedMemoryPair(physicalRoot)
+  if (!request || typeof request !== 'object') throw new Error('request must contain topic and index writes')
+  const topicPath = validateMemoryPath(request.topic?.path)
+  if (topicPath === 'AGENTS.md') throw new Error('topic.path must be topics/<single-name>.md')
+  if (request.index?.path !== 'AGENTS.md') throw new Error('index.path must be AGENTS.md')
+  const topic = await prepareAtomicMemoryWrite(optionsFor(physicalRoot, topicPath, request.topic))
+  let index
+  try {
+    index = await prepareAtomicMemoryWrite(optionsFor(physicalRoot, 'AGENTS.md', request.index))
+    await backupPrepared(topic)
+    await backupPrepared(index)
+    const journal = {
+      version: 1,
+      root: physicalRoot,
+      phase: 'prepared',
+      topic: snapshotPrepared(topic),
+      index: snapshotPrepared(index),
+      createdAt: new Date().toISOString(),
+    }
+    await writeJournal(physicalRoot, journal)
+    const topicResult = await commitPrepared(topic, { backup: false })
+    journal.phase = 'topic-committed'
+    await writeJournal(physicalRoot, journal)
+    try {
+      const indexResult = await commitPrepared(index, { backup: false })
+      journal.phase = 'index-committed'
+      await writeJournal(physicalRoot, journal)
+      await removeIfPresent(journalPath(physicalRoot))
+      return { operation: 'pair-update', topic: topicResult, index: indexResult }
+    } catch (error) {
+      await restoreSnapshot(journal.topic)
+      await removeIfPresent(journalPath(physicalRoot))
+      throw error
+    }
+  } finally {
+    await discardPrepared(topic)
+    if (index) await discardPrepared(index)
+  }
+}
+
+export { revisionOf }
