@@ -5,23 +5,14 @@
  * 且其依赖的 dsh-hook-protocol 从未进入内核，所以 ~/.dsh/hooks.json 不会被读取。
  * 本插件改用 DSH 原生扩展点 agent/turn-stopping 实现同样的「轮末提醒」。
  *
- * ===== 语义 v2（2026-11-15 改为「方案 C」）=====
- * v1 的判据是「全局一天提示一次」，标记文件不带 sessionId：
- * 任何一个会话用掉当天额度，其余会话当天全部静默。实测事故——23:31 在会话 A
- * 用 bash+提权写记忆，因 12:40 会话 B 已用掉额度而全程无提醒。
+ * ===== 语义 v3：三模式 + settled success =====
+ * - strict（默认）：有改变状态的工具才做常规检查；
+ * - trigger-aware：strict 之外，用户消息命中字面触发词也检查；
+ * - manual：只保留命令直写记忆与专用 writer 失败这两类硬提醒。
  *
- * v2 改为「每会话每轮判定」，判据按顺序：
- *   1. 本轮没有任何「改变状态」的工具调用        → 静默（纯问答不打扰）
- *   2. 本轮已调用 write_shared_memory /
- *      write_project_memory                    → 静默（已尽责，不打扰）
- *   3. 本轮用 bash/pwsh/python 等命令碰了
- *      .agents / topics / AGENTS.md 路径        → 强提醒「换专用工具，零提权」
- *   4. 其余「干了活但没写记忆」                  → 常规提醒一次
- *   5. 同一 (会话, 轮次) 只提醒一次              → 防重入
- *   6. 任何异常                                  → 静默放行（绝不打断对话）
- *
- * 为什么 3 优先于 4：用错通道是硬错误（会触发沙箱拒绝或白费一次审批），
- * 必须在同一轮就点破；而「该不该沉淀」是判断题，可以温和提醒。
+ * 三档共同规则：专用记忆工具只有 settled 结果成功才算已沉淀；失败不能压掉提醒。
+ * 同一 (会话, 轮次) 只提醒一次，去重集合与审计历史均有上限；任何异常静默放行。
+ * 用错通道优先于常规提醒，因为它是确定性的硬错误。
  *
  * 工具名与参数来源（两路并用）：
  *   - `tools/pre-execute` 的 exec.name：只覆盖模型直接发起的顶层工具调用；
@@ -76,8 +67,32 @@ const COMMAND_TOOLS = new Set([
   'bash', 'ops_bash', 'shell', 'exec', 'run', 'pwsh', 'powershell',
 ]);
 
-/** 记忆写入专用工具：调用了就说明已尽责。 */
+/** 记忆写入专用工具：调用只记 attempt，settled success 才算已尽责。 */
 const MEMORY_TOOLS = new Set(['write_shared_memory', 'write_shared_memory_pair', 'write_project_memory']);
+
+const CHECKPOINT_MODES = new Set(['strict', 'trigger-aware', 'manual']);
+const DEFAULT_MODE = 'strict';
+const DEFAULT_MAX_REMEMBERED = 256;
+const DEFAULT_AUDIT_HISTORY_LIMIT = 100;
+const DEFAULT_TRIGGER_WORDS = [
+  '记住', '记一下', '记到记忆', '别忘', '以后', '下次', '不要再', '别再', '纠正', '更正',
+  'remember', "don't forget", 'do not forget', 'from now on', 'next time',
+];
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function triggerPattern(words) {
+  const list = Array.isArray(words) && words.length > 0 ? words : DEFAULT_TRIGGER_WORDS;
+  const clean = list.map((item) => String(item || '').trim()).filter(Boolean);
+  return clean.length > 0 ? new RegExp(clean.map(escapeRegExp).join('|'), 'i') : null;
+}
+
+function messageText(message) {
+  const parts = Array.isArray(message?.content) ? message.content : [];
+  return parts.filter((item) => item?.type === 'text').map((item) => String(item.text || '')).join('\n');
+}
 
 /** 记忆文件路径特征。 */
 const MEMORY_PATH_RE = /(\.agents[\\/]|\.agents\b|topics[\\/]|AGENTS\.md)/i;
@@ -184,19 +199,29 @@ function markerPaths() {
   return {
     dir,
     file: path.join(dir, 'agent-auto-memory-checkpoint-last.json'),
+    history: path.join(dir, 'agent-auto-memory-checkpoint-history.json'),
   };
 }
 
-/** 记一条审计痕迹；失败不影响功能。 */
-function markPrompted(kind) {
+/** 记一条审计痕迹；last 供快速体检，history 有界保留；失败不影响功能。 */
+function markPrompted(kind, mode, historyLimit) {
   try {
-    const { dir, file } = markerPaths();
+    const { dir, file, history } = markerPaths();
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(
-      file,
-      JSON.stringify({ date: todayStr(), at: new Date().toISOString(), kind }, null, 2),
-      'utf8',
-    );
+    const entry = { date: todayStr(), at: new Date().toISOString(), kind, mode };
+    fs.writeFileSync(file, JSON.stringify(entry, null, 2), 'utf8');
+    if (historyLimit > 0) {
+      let rows = [];
+      try {
+        const value = JSON.parse(fs.readFileSync(history, 'utf8'));
+        if (Array.isArray(value)) rows = value;
+      } catch {
+        /* Missing or corrupt history starts a fresh bounded ledger. */
+      }
+      rows.push(entry);
+      if (rows.length > historyLimit) rows = rows.slice(-historyLimit);
+      fs.writeFileSync(history, JSON.stringify(rows, null, 2), 'utf8');
+    }
     return true;
   } catch {
     return false;
@@ -228,6 +253,12 @@ export function applyCheckpoint(ctx, config = {}) {
   const suspiciousReason = config.suspiciousReason || SUSPICIOUS_REASON;
   const enabled = config.enabled !== false;
   const detectSuspicious = config.detectSuspicious !== false;
+  const mode = CHECKPOINT_MODES.has(config.mode) ? config.mode : DEFAULT_MODE;
+  const triggers = triggerPattern(config.triggerWords);
+  const maxRemembered = Number.isInteger(config.maxRemembered) && config.maxRemembered > 0
+    ? Math.min(config.maxRemembered, 10000) : DEFAULT_MAX_REMEMBERED;
+  const auditHistoryLimit = Number.isInteger(config.auditHistoryLimit) && config.auditHistoryLimit >= 0
+    ? Math.min(config.auditHistoryLimit, 1000) : DEFAULT_AUDIT_HISTORY_LIMIT;
 
   if (!enabled) {
     ctx.logger?.debug?.(`[${NS}] disabled by config`);
@@ -236,13 +267,21 @@ export function applyCheckpoint(ctx, config = {}) {
 
   /** sessionId -> per-turn observation state. */
   const state = new Map();
-  /** One reminder per session and turn, preventing steer re-entry. */
+  /** One reminder per session and turn, with bounded retention for long-lived sessions. */
   const reminded = new Set();
+  const reminderOrder = [];
+  const remember = (key) => {
+    if (reminded.has(key)) return false;
+    reminded.add(key);
+    reminderOrder.push(key);
+    while (reminderOrder.length > maxRemembered) reminded.delete(reminderOrder.shift());
+    return true;
+  };
 
   const ensure = (sid) => {
     let st = state.get(sid);
     if (!st) {
-      st = { sawMutation: false, wroteMemory: false, memoryWriteFailed: false, suspiciousWrite: false, pendingMemoryCalls: new Map() };
+      st = { sawMutation: false, wroteMemory: false, memoryWriteFailed: false, suspiciousWrite: false, triggered: false, pendingMemoryCalls: new Map() };
       state.set(sid, st);
     }
     return st;
@@ -289,7 +328,16 @@ export function applyCheckpoint(ctx, config = {}) {
         st.wroteMemory = false;
         st.memoryWriteFailed = false;
         st.suspiciousWrite = false;
+        st.triggered = false;
         st.pendingMemoryCalls.clear();
+        return;
+      }
+      if (event?.type === 'user/message') {
+        const message = event?.data?.message || event?.data;
+        const sourceKind = message?.source?.kind;
+        if ((sourceKind === 'user' || sourceKind == null) && triggers?.test(messageText(message))) {
+          ensure(session.id).triggered = true;
+        }
         return;
       }
       if (event?.type === 'tool/call') {
@@ -332,11 +380,16 @@ export function applyCheckpoint(ctx, config = {}) {
 
       const st = state.get(sid);
       if (!st) return;
-      if (st.sawMutation !== true) return;   // 判据 1：没干活不打扰
-      if (st.wroteMemory === true) return;   // 判据 2：专用工具已成功落盘
+      if (st.wroteMemory === true) return;   // 专用工具已成功落盘
+      const eligible = mode === 'strict'
+        ? st.sawMutation === true
+        : mode === 'trigger-aware'
+          ? (st.sawMutation === true || st.triggered === true)
+          : (st.suspiciousWrite === true || st.memoryWriteFailed === true);
+      if (!eligible) return;
 
       const key = `${sid}#${turn}`;
-      if (reminded.has(key)) return;         // 判据 5：同轮只提醒一次
+      if (reminded.has(key)) return;         // 同轮只提醒一次
 
       let text;
       let kind;
@@ -348,8 +401,8 @@ export function applyCheckpoint(ctx, config = {}) {
         kind = 'remind';
       }
 
-      reminded.add(key);
-      ctx.logger?.info?.(`[${NS}] turn-stopping: ${kind} (turn=${turn})`);
+      if (!remember(key)) return;
+      ctx.logger?.info?.(`[${NS}] turn-stopping: ${kind} (mode=${mode}, turn=${turn})`);
       // steer 契约是完整 UserMessage：v4 读取端 assertMessageEventShape 要求
       // id（非空串）、role:'user'、source 对象、content 数组，缺一即判会话 corrupt。
       // 官方 createUserMessage 会自动补 id/role；插件拿不到该内部 API，必须自建全字段。
@@ -359,12 +412,12 @@ export function applyCheckpoint(ctx, config = {}) {
         content: [{ type: 'text', text }],
         source: { kind: NS },
       });
-      markPrompted(kind);
+      markPrompted(kind, mode, auditHistoryLimit);
     } catch (error) {
       // 判据 6：任何异常静默放行，绝不打断对话
       ctx.logger?.warn?.(`[${NS}] turn-stopping check failed: ${String(error)}`);
     }
   });
 
-  ctx.logger?.info?.(`[${NS}] loaded (v2: per-turn, suspicious-channel detection)`);
+  ctx.logger?.info?.(`[${NS}] loaded (mode=${mode}, maxRemembered=${maxRemembered}, auditHistoryLimit=${auditHistoryLimit})`);
 }

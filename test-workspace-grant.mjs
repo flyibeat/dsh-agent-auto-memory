@@ -28,12 +28,13 @@ fs.mkdirSync(BARE, { recursive: true });
 function makeCtx() {
   const handlers = new Map();
   const registered = [];
+  const disposed = [];
   return {
-    registered,
+    registered, disposed,
     ctx: {
       logger: { info() {}, warn() {}, debug() {}, error() {} },
       on(ev, fn) { if (!handlers.has(ev)) handlers.set(ev, []); handlers.get(ev).push(fn); return () => {}; },
-      sandboxPolicy: { registerWritableRoot(session, dir) { registered.push({ session, dir }); return () => {}; } },
+      sandboxPolicy: { registerWritableRoot(session, dir) { registered.push({ session, dir }); return () => { disposed.push({ session, dir }); }; } },
     },
     fire(ev, ...args) { for (const fn of handlers.get(ev) ?? []) fn(...args); },
     events() { return [...handlers.keys()]; },
@@ -53,6 +54,7 @@ check('apply 是函数', typeof mod.apply === 'function');
   mod.apply(c.ctx, { audit: false });
   check('监听 session/created', c.events().includes('session/created'));
   check('监听 session/event', c.events().includes('session/event'));
+  check('监听 session/disposed', c.events().includes('session/disposed'));
 }
 
 // 3. 子目录会话 → 注册父项目根
@@ -137,7 +139,66 @@ check('apply 是函数', typeof mod.apply === 'function');
   check('注册失败被吞掉、不打断会话', !threw);
 }
 
-// 11. findProjectRoot 契约
+
+// 11. projectRoot 固定根、projectRoots allow-list 与宽根拒绝
+{
+  const fixed = makeCtx();
+  mod.apply(fixed.ctx, { audit: false, projectRoot: PROJ });
+  fixed.fire('session/created', { id: 's-fixed', header: { cwd: path.join(PROJ, 'sub', 'deeper') } });
+  check('projectRoot 固定根只授权其内部会话', fixed.registered.length === 1 && fixed.registered[0].dir.toLowerCase() === PROJ.toLowerCase());
+
+  const denied = makeCtx();
+  mod.apply(denied.ctx, { audit: false, projectRoots: [BARE] });
+  denied.fire('session/created', { id: 's-denied', header: { cwd: path.join(PROJ, 'sub') } });
+  check('发现的项目根不在 projectRoots 时拒绝', denied.registered.length === 0);
+
+  const allowed = makeCtx();
+  mod.apply(allowed.ctx, { audit: false, projectRoots: [PROJ] });
+  allowed.fire('session/created', { id: 's-allowed', header: { cwd: path.join(PROJ, 'sub') } });
+  check('发现的项目根命中 projectRoots 时授权', allowed.registered.length === 1);
+
+  const broad = makeCtx();
+  mod.apply(broad.ctx, { audit: false, projectRoot: path.parse(PROJ).root });
+  broad.fire('session/created', { id: 's-broad', header: { cwd: path.join(PROJ, 'sub') } });
+  check('默认拒绝盘符根授权', broad.registered.length === 0);
+}
+
+// 12. session/disposed 精确撤销且每个 apply 实例互不共享状态
+{
+  const c = makeCtx();
+  mod.apply(c.ctx, { audit: false });
+  const session = { id: 's-dispose', header: { cwd: path.join(PROJ, 'sub') } };
+  c.fire('session/created', session);
+  c.fire('session/disposed', session);
+  c.fire('session/disposed', session);
+  check('session/disposed 只调用一次 grant disposer', c.disposed.length === 1);
+
+  const a = makeCtx(); const b = makeCtx();
+  mod.apply(a.ctx, { audit: false }); mod.apply(b.ctx, { audit: false });
+  const shared = { id: 's-two-contexts', header: { cwd: path.join(PROJ, 'sub') } };
+  a.fire('session/created', shared); b.fire('session/created', shared);
+  check('不同 apply 实例各自维护 WeakMap', a.registered.length === 1 && b.registered.length === 1);
+}
+
+// 13. 链接标记不构成项目根
+{
+  const linked = path.join(TMP, 'linked-marker');
+  fs.mkdirSync(linked, { recursive: true });
+  let supported = true;
+  try {
+    fs.symlinkSync(path.join(PROJ, '.agents'), path.join(linked, '.agents'), process.platform === 'win32' ? 'junction' : 'dir');
+  } catch {
+    supported = false;
+  }
+  if (supported) {
+    const located = findProjectRoot(linked, ['.agents'], 0);
+    check('符号链接/junction marker 被拒绝', located.root === undefined);
+  } else {
+    console.log('  - 跳过链接 marker：当前环境不允许创建链接');
+  }
+}
+
+// 14. findProjectRoot 契约
 {
   const located = findProjectRoot(path.join(PROJ, 'sub', 'deeper'), ['.agents', 'AGENTS.md'], 3);
   check('findProjectRoot 上溯到含标记的祖先', located.root && located.root.toLowerCase() === PROJ.toLowerCase());

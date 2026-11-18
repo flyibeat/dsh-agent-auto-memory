@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-auto-memory",
-  "version": "1.2.0",
-  "description": "Auditable automatic memory infrastructure for DeepSeek Harness: result-aware turn-end checks, revision-checked single and paired memory writers, one previous version per target with provenance, and session-scoped project-root grants.",
+  "version": "1.3.0",
+  "description": "Auditable automatic memory infrastructure for DeepSeek Harness: three-mode result-aware checkpoints, transactional memory writers with one previous version per target, and least-privilege session-scoped project-root grants.",
   "type": "module",
   "main": "index.js",
   "exports": {

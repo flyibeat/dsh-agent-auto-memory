@@ -1,4 +1,4 @@
-import { statSync } from 'node:fs'
+import { lstatSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { writeProjectMemory, revisionOf, validateProjectPath } from './project-memory-store.mjs'
 
@@ -10,11 +10,17 @@ const DEFAULT_MAX_LEVELS = 3
 
 function kindOf(path) {
   try {
-    const stat = statSync(path)
+    const stat = lstatSync(path)
+    if (stat.isSymbolicLink()) return undefined
     return stat.isDirectory() ? 'dir' : stat.isFile() ? 'file' : undefined
   } catch {
     return undefined
   }
+}
+
+function pathKey(value) {
+  const resolved = resolve(value)
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
 /** Session workspace from the tool execution, never the host process cwd. */
@@ -96,7 +102,7 @@ export function applyProjectMemoryTool(ctx, config = {}) {
         if (root === undefined) {
           throw new Error('project root not found: inspected ' + JSON.stringify(inspected) + ' for markers ' + JSON.stringify(markers) + ' within ' + maxLevels + ' level(s) of the session workspace; set projectRoot in the project-writer config')
         }
-        if (allowList.length > 0 && !allowList.some((allowed) => resolve(allowed) === resolve(root))) {
+        if (allowList.length > 0 && !allowList.some((allowed) => pathKey(allowed) === pathKey(root))) {
           throw new Error('project root ' + root + ' is not in the configured projectRoots allow-list')
         }
         return writeProjectMemory(root, args)

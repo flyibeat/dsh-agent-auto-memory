@@ -93,6 +93,13 @@ function resetHome(tag) {
 
 const textOf = (msg) => String(msg?.content?.[0]?.text || '');
 
+async function userMessage(ctx, sid, text, source = { kind: 'user' }) {
+  await ctx.emit('session/event', { id: sid }, {
+    type: 'user/message',
+    data: { id: 'user-' + (++callSequence), role: 'user', content: [{ type: 'text', text }], source },
+  });
+}
+
 console.log('\n=== 1. 模块形态 ===');
 check('导出 apply', typeof mod.apply === 'function');
 check('导出 name', mod.name === 'agent-auto-memory-checkpoint');
@@ -103,6 +110,66 @@ console.log('\n=== 2. 纯问答（无工具）→ 静默 ===');
   await ctx.emit('session/event', { id: 's1' }, { type: 'turn/start' });
   await ctx.emit('agent/turn-stopping', { agent: mkAgent(ctx, 's1'), turn: 1 });
   check('未 steer', ctx._steers.length === 0);
+}
+
+
+console.log('\n=== 2b. 三模式：strict / trigger-aware / manual ===');
+{
+  resetHome('mode-strict'); const strict = makeCtx(); mod.apply(strict, { mode: 'strict' });
+  await strict.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  await userMessage(strict, 's', '以后请记住这个偏好');
+  await strict.emit('agent/turn-stopping', { agent: mkAgent(strict, 's'), turn: 1 });
+  check('strict：只有口头触发词、没有状态变更时静默', strict._steers.length === 0);
+
+  resetHome('mode-aware'); const aware = makeCtx(); mod.apply(aware, { mode: 'trigger-aware' });
+  await aware.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  await userMessage(aware, 's', '普通问题，不要求记忆');
+  await aware.emit('agent/turn-stopping', { agent: mkAgent(aware, 's'), turn: 1 });
+  check('trigger-aware：无触发词的纯问答静默', aware._steers.length === 0);
+  await aware.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  await userMessage(aware, 's', '下次别再这样做');
+  await aware.emit('agent/turn-stopping', { agent: mkAgent(aware, 's'), turn: 2 });
+  check('trigger-aware：口头触发词无需工具也提醒', aware._steers.length === 1);
+
+  resetHome('mode-aware-success'); const success = makeCtx(); mod.apply(success, { mode: 'trigger-aware' });
+  await success.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  await userMessage(success, 's', '以后请记住');
+  const saved = await callTool(success, 's', 'write_shared_memory', { path: 'AGENTS.md' });
+  await settleTool(success, 's', saved, false);
+  await success.emit('agent/turn-stopping', { agent: mkAgent(success, 's'), turn: 1 });
+  check('trigger-aware：成功 writer 优先静默', success._steers.length === 0);
+
+  resetHome('mode-custom'); const custom = makeCtx(); mod.apply(custom, { mode: 'trigger-aware', triggerWords: ['永久偏好'] });
+  await custom.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  await userMessage(custom, 's', '以后再说');
+  await custom.emit('agent/turn-stopping', { agent: mkAgent(custom, 's'), turn: 1 });
+  await custom.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  await userMessage(custom, 's', '这是永久偏好');
+  await custom.emit('agent/turn-stopping', { agent: mkAgent(custom, 's'), turn: 2 });
+  check('triggerWords 可替换默认词表', custom._steers.length === 1);
+
+  resetHome('mode-plugin'); const plugin = makeCtx(); mod.apply(plugin, { mode: 'trigger-aware' });
+  await plugin.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  await userMessage(plugin, 's', '记住这句', { kind: 'plugin', plugin: 'other' });
+  await plugin.emit('agent/turn-stopping', { agent: mkAgent(plugin, 's'), turn: 1 });
+  check('trigger-aware：插件注入消息不会自触发', plugin._steers.length === 0);
+
+  resetHome('mode-manual'); const manual = makeCtx(); mod.apply(manual, { mode: 'manual' });
+  await manual.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  await callTool(manual, 's', 'write', { file_path: 'a.md' });
+  await manual.emit('agent/turn-stopping', { agent: mkAgent(manual, 's'), turn: 1 });
+  check('manual：普通状态变更不提醒', manual._steers.length === 0);
+  await manual.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  await callTool(manual, 's', 'ops_bash', { command: 'echo x > ~/.agents/topics/a.md' });
+  await manual.emit('agent/turn-stopping', { agent: mkAgent(manual, 's'), turn: 2 });
+  check('manual：命令直写记忆仍强提醒', manual._steers.length === 1 && textOf(manual._steers[0]).includes('通道检查'));
+
+  resetHome('mode-manual-failed'); const failed = makeCtx(); mod.apply(failed, { mode: 'manual' });
+  await failed.emit('session/event', { id: 's' }, { type: 'turn/start' });
+  const id = await callTool(failed, 's', 'write_shared_memory', { path: '../bad' });
+  await settleTool(failed, 's', id, true);
+  await failed.emit('agent/turn-stopping', { agent: mkAgent(failed, 's'), turn: 1 });
+  check('manual：专用记忆工具失败仍提醒', failed._steers.length === 1);
 }
 
 console.log('\n=== 3. 只读工具 read/grep/glob → 静默 ===');
@@ -364,7 +431,24 @@ console.log('\n=== 18. 标记文件位置与内容（仅审计，非闸门）===
     check('日期是今天（本地日历）', j.date === localToday);
     check('含时间戳', typeof j.at === 'string');
     check('含 kind', j.kind === 'remind' || j.kind === 'suspicious');
+    check('含 mode', j.mode === 'strict');
   }
+}
+
+console.log('\n=== 19. 审计历史与提醒去重都有上限 ===');
+{
+  const home = resetHome('bounded-history'); const ctx = makeCtx();
+  mod.apply(ctx, { auditHistoryLimit: 2, maxRemembered: 2 });
+  for (let turn = 1; turn <= 3; turn++) {
+    await ctx.emit('session/event', { id: 's' }, { type: 'turn/start' });
+    await callTool(ctx, 's', 'write', { file_path: 'a-' + turn + '.md' });
+    await ctx.emit('agent/turn-stopping', { agent: mkAgent(ctx, 's'), turn });
+  }
+  const historyFile = path.join(home, 'logs', 'agent-auto-memory-checkpoint-history.json');
+  const history = JSON.parse(fs.readFileSync(historyFile, 'utf8'));
+  check('审计历史只保留配置的最后 2 条', history.length === 2 && history.every((row) => row.mode === 'strict'));
+  await ctx.emit('agent/turn-stopping', { agent: mkAgent(ctx, 's'), turn: 1 });
+  check('maxRemembered=2 时最旧 turn key 会被淘汰', ctx._steers.length === 4);
 }
 
 console.log(`\n===== ${pass} 通过 / ${fail} 失败 =====`);

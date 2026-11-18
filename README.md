@@ -16,7 +16,7 @@ Bundle 安装四个 Cordis 插件行，可在插件管理器分别启停：
 | 行 ID | 能力 | 默认 |
 |---|---|---|
 | `agent-auto-memory-checkpoint` | 在 `agent/turn-stopping` 逐轮检查是否可能漏写记忆，或是否用命令通道直写了记忆文件，必要时 steer 提醒 | 开 |
-| `agent-auto-memory-writer` | 注册 `write_shared_memory`，只写共享 Agent 记忆根 | 开 |
+| `agent-auto-memory-writer` | 注册 `write_shared_memory` 与 `write_shared_memory_pair`，只写共享 Agent 记忆根 | 开 |
 | `agent-auto-memory-project-writer` | 注册 `write_project_memory`，写会话所属项目的 `AGENTS.md` 与 `.agents/topics/` | 开 |
 | `agent-auto-memory-workspace-grant` | 按会话授权父项目根，让文件工具可写项目内其它文件 | 开 |
 
@@ -24,7 +24,15 @@ Bundle 安装四个 Cordis 插件行，可在插件管理器分别启停：
 
 ## 轮末检查能力
 
-**逐轮判定，不再「全局一天一次」。** v1.0.x 的标记文件不带 sessionId，任何一个会话用掉当天额度后，其余会话当天全部静默——多会话场景下会整轮漏提醒。v1.1.0 起改为按 (会话, 轮次) 判定，判据按顺序：
+**逐轮判定，不再「全局一天一次」。** 每个模式都只在专用 writer 的 settled 结果确认成功后静默；失败调用仍提醒。`mode` 有三档，默认 `strict` 保持兼容：
+
+| mode | 触发常规提醒 | 始终保留的硬提醒 |
+|---|---|---|
+| `strict` | 本轮有改变状态的工具 | 命令直写记忆、专用 writer 失败 |
+| `trigger-aware` | strict 条件，或用户消息命中“记住/以后/下次/别再/纠正”等确定性词 | 同左 |
+| `manual` | 不做一般轮末催写 | 命令直写记忆、专用 writer 失败 |
+
+`strict` 的逐轮判据按顺序：
 
 1. 本轮没有任何改变状态的工具调用 → 静默（纯问答、只读轮次不打扰）。
 2. 本轮 `write_shared_memory` / `write_shared_memory_pair` / `write_project_memory` 的 settled 结果确认成功 → 静默；仅调用、revision conflict 或其它失败都不算已沉淀。
@@ -39,7 +47,7 @@ Bundle 安装四个 Cordis 插件行，可在插件管理器分别启停：
 `echo "见 ~/.agents/topics/x.md" > /dev/null`、`grep foo ~/.agents/topics/a.md > /tmp/o.txt`、
 `cp ~/.agents/topics/a.md D:/work/backup.md` 这些都会误报——误报多了提醒就会被忽略，正好抵消检测的意义。解析不出目标时保守放行（宁可多提醒一次，也不漏掉真实直写）。
 
-标记文件 `$DSH_HOME/logs/agent-auto-memory-checkpoint-last.json` 仍会写，但只作审计与统计，**不再作为闸门**。
+`$DSH_HOME/logs/agent-auto-memory-checkpoint-last.json` 只保存最后一次审计事实；`agent-auto-memory-checkpoint-history.json` 默认有界保留最后 100 条。会话内去重 key 默认最多 256 个，长会话不会无限增长；两者都不是提醒闸门。
 
 ## 安全写入能力
 
@@ -79,6 +87,19 @@ Bundle 安装四个 Cordis 插件行，可在插件管理器分别启停：
     projectRoots: [D:\\work\\my-project] # 允许列表；探测结果不在此列即拒绝
 ```
 
+### 最小权限 workspace-grant
+
+```yaml
+- id: agent-auto-memory-workspace-grant
+  config:
+    projectRoot: D:\\work\\my-project      # 可选：固定根，只授权其内部会话
+    projectRoots: [D:\\work\\my-project] # 可选：自动探测结果允许列表
+    extraRoots: []                                # 兼容显式额外根；仍要求 cwd 位于根内
+    allowBroadRoots: false                        # 默认拒绝盘符根和用户主目录
+```
+
+marker 必须是物理文件/目录，符号链接与 junction 不算项目标记；Windows 路径比较忽略大小写。每个插件实例独立保存 Session grant，`session/disposed` 时立即调用 disposer，恢复/派生会话仍需重新登记。
+
 ## 配置
 
 ### 自定义 checkpoint
@@ -87,6 +108,10 @@ Bundle 安装四个 Cordis 插件行，可在插件管理器分别启停：
 - id: agent-auto-memory-checkpoint
   config:
     enabled: true
+    mode: strict                  # strict / trigger-aware / manual
+    triggerWords: ['记住', '以后', '下次', '别再']
+    maxRemembered: 256            # 同一活体实例保留的 turn 去重 key 上限
+    auditHistoryLimit: 100        # 0 关闭历史，只保留 last marker
     reason: "可选的自定义提醒文本"
     suspiciousReason: "可选：检测到命令通道直写记忆文件时的提醒文本"
     detectSuspicious: true   # 关掉则只保留「干了活但没写记忆」的常规提醒
@@ -143,6 +168,7 @@ node --check memory-store.mjs
 node test-offline.mjs
 node test-writer.mjs
 node test-project-writer.mjs
+node test-workspace-grant.mjs
 node test-integration.mjs
 npm pack --dry-run
 ```

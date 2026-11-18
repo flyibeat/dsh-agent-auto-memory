@@ -1,22 +1,6 @@
 /**
- * agent-auto-memory-workspace-grant —— 让「开在项目子目录里的会话」能直接写父项目根。
- *
- * 为什么需要：DSH 的 workspace-write 只放行会话工作区根。会话开在
- * <项目根>\<子目录> 时，父项目根的 AGENTS.md、.agents/topics/、会话总表.md、
- * skills/ 全在可写根之外，普通 write/edit 一律 file access denied，只能提权。
- *
- * 做法：用 sandbox-policy 暴露的正规运行时接口
- *   ctx.sandboxPolicy.registerWritableRoot(session, directory)
- * 按会话把「项目根」注册进额外可写目录。它返回 Cordis effect disposer，卸载即收回；
- * 配置里的 extraRoots 也走同一接口，供不靠 .agents/AGENTS.md 判定的项目使用。
- *
- * 边界（源码已确认，不要夸大）：
- *  - Windows 上额外目录授权只对 harness 文件工具生效，沙箱子进程（bash/pwsh）忽略它，
- *    因此命令里建 .bak、跑脚本仍会被拒 —— 这是平台限制，本插件绕不过去。
- *  - 授权只属于这一个存活 Session；其它会话、子 agent 的会话不继承，
- *    恢复或派生的会话需要自己再注册一次（本插件在 turn/start 会补登记）。
- *  - 项目根判定与 project-writer 完全一致：从会话 header.cwd 向上找最近的、
- *    含 .agents 或 AGENTS.md 的目录，最多上溯 maxLevels 层。
+ * agent-auto-memory-workspace-grant — grant one live Session its owning project root.
+ * The grant is file-tool only on Windows, never inherited by subprocesses or other Sessions.
  */
 import fs from 'node:fs'
 import os from 'node:os'
@@ -24,17 +8,40 @@ import path from 'node:path'
 import { findProjectRoot } from './project-memory-tool.mjs'
 
 export const name = 'agent-auto-memory-workspace-grant'
-
-// 硬注入：sandboxPolicy 不在的组合（headless / minimal）静默不激活，不报错。
 export const inject = ['sandboxPolicy']
 
 const DEFAULT_MARKERS = ['.agents', 'AGENTS.md']
 const DEFAULT_MAX_LEVELS = 3
 
-/** session -> disposer，避免同一会话每轮重复注册。 */
-const granted = new WeakMap()
+function pathKey(value) {
+  const resolved = path.resolve(value)
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
 
-/** 审计行：每会话一次授权记一行，既是证据也可排障；写失败一律静默。 */
+function samePath(a, b) {
+  return pathKey(a) === pathKey(b)
+}
+
+function isInside(candidate, root) {
+  const here = pathKey(candidate)
+  const base = pathKey(root)
+  return here === base || here.startsWith(base + path.sep)
+}
+
+function isBroadRoot(value) {
+  const resolved = path.resolve(value)
+  return samePath(resolved, path.parse(resolved).root) || samePath(resolved, os.homedir())
+}
+
+function safeDirectory(value) {
+  try {
+    const stat = fs.lstatSync(value)
+    return stat.isDirectory() && !stat.isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
 function auditLine(line) {
   try {
     const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
@@ -42,7 +49,7 @@ function auditLine(line) {
     fs.mkdirSync(dirPath, { recursive: true })
     fs.appendFileSync(path.join(dirPath, 'agent-auto-memory-workspace-grant.log'), new Date().toISOString() + ' ' + line + '\n', 'utf8')
   } catch {
-    /* 审计不能影响会话 */
+    /* Audit must never affect a Session. */
   }
 }
 
@@ -51,54 +58,108 @@ export function apply(ctx, config = {}) {
 
   const markers = Array.isArray(config.markers) && config.markers.length > 0 ? config.markers : DEFAULT_MARKERS
   const maxLevels = Number.isInteger(config.maxLevels) && config.maxLevels >= 0 ? config.maxLevels : DEFAULT_MAX_LEVELS
-  const extraRoots = Array.isArray(config.extraRoots) ? config.extraRoots.filter((r) => typeof r === 'string' && r.trim()) : []
+  const fixedRoot = typeof config.projectRoot === 'string' && config.projectRoot.trim() ? path.resolve(config.projectRoot.trim()) : undefined
+  const allowRoots = Array.isArray(config.projectRoots)
+    ? config.projectRoots.filter((item) => typeof item === 'string' && item.trim()).map((item) => path.resolve(item.trim()))
+    : []
+  const extraRoots = Array.isArray(config.extraRoots)
+    ? config.extraRoots.filter((item) => typeof item === 'string' && item.trim()).map((item) => path.resolve(item.trim()))
+    : []
+  const allowBroadRoots = config.allowBroadRoots === true
   const audit = config.audit !== false
+  const granted = new WeakMap()
 
-  const note = (line) => { if (audit) auditLine(line); try { ctx.logger?.debug?.('[' + name + '] ' + line) } catch {} }
+  const note = (line) => {
+    if (audit) auditLine(line)
+    try { ctx.logger?.debug?.('[' + name + '] ' + line) } catch {}
+  }
 
-  // 加载即记一笔：这是「Host 真的把本行组合进来了」的唯一直接证据。
-  note('loaded; markers=' + JSON.stringify(markers) + ' maxLevels=' + maxLevels + ' extraRoots=' + JSON.stringify(extraRoots))
+  note('loaded; markers=' + JSON.stringify(markers) + ' maxLevels=' + maxLevels +
+    ' projectRoot=' + JSON.stringify(fixedRoot) + ' projectRoots=' + JSON.stringify(allowRoots) +
+    ' extraRoots=' + JSON.stringify(extraRoots) + ' allowBroadRoots=' + allowBroadRoots)
 
-  /** 同步完成判定与注册：findProjectRoot 是纯同步函数，所以不存在「授权晚于首个工具调用」的竞态。 */
+  const accepted = (target, reason) => {
+    if (!allowBroadRoots && isBroadRoot(target)) {
+      note('skip broad root ' + target + ' (' + reason + ')')
+      return false
+    }
+    if (!safeDirectory(target)) {
+      note('skip unsafe or missing directory ' + target + ' (' + reason + ')')
+      return false
+    }
+    return true
+  }
+
   const grant = (session) => {
     try {
       if (!session || granted.has(session)) return
-      const cwd = session?.header?.cwd
-      const targets = []
-      if (typeof cwd === 'string' && cwd.trim() !== '') {
-        const root = findProjectRoot(cwd.trim(), markers, maxLevels).root
-        if (root !== undefined && path.resolve(root) !== path.resolve(cwd.trim())) targets.push(root)
-      }
-      // extraRoots 只发给「cwd 落在该根之内」的会话，避免闲聊等无关会话白拿授权。
-      if (typeof cwd === 'string' && cwd.trim() !== '') {
-        const here = path.resolve(cwd.trim())
-        for (const extra of extraRoots.map((r) => path.resolve(r))) {
-          if (here === extra || here.startsWith(extra + path.sep)) targets.push(extra)
+      const rawCwd = session?.header?.cwd
+      if (typeof rawCwd !== 'string' || rawCwd.trim() === '') return
+      const cwd = path.resolve(rawCwd.trim())
+      const candidates = []
+
+      if (fixedRoot !== undefined) {
+        if (isInside(cwd, fixedRoot) && !samePath(cwd, fixedRoot)) candidates.push([fixedRoot, 'projectRoot'])
+      } else {
+        const located = findProjectRoot(cwd, markers, maxLevels)
+        const root = located.root
+        if (root !== undefined && !samePath(root, cwd)) {
+          if (allowRoots.length === 0 || allowRoots.some((allowed) => samePath(allowed, root))) {
+            candidates.push([root, 'marker'])
+          } else {
+            note('skip discovered root outside projectRoots: ' + root)
+          }
         }
       }
-      if (targets.length === 0) return
+
+      for (const extra of extraRoots) {
+        if (isInside(cwd, extra) && !samePath(cwd, extra)) candidates.push([extra, 'extraRoot'])
+      }
+
+      const unique = new Map()
+      for (const [target, reason] of candidates) {
+        const resolved = path.resolve(target)
+        if (!unique.has(pathKey(resolved)) && accepted(resolved, reason)) unique.set(pathKey(resolved), resolved)
+      }
+      if (unique.size === 0) return
+
       const disposers = []
-      for (const target of [...new Set(targets.map((t) => path.resolve(t)))]) {
+      for (const target of unique.values()) {
         try {
-          disposers.push(ctx.sandboxPolicy.registerWritableRoot(session, target))
+          const dispose = ctx.sandboxPolicy.registerWritableRoot(session, target)
+          if (typeof dispose === 'function') disposers.push(dispose)
           note('granted ' + target + ' for session ' + (session.id ?? '?'))
         } catch (error) {
           note('skip ' + target + ': ' + (error && error.message))
         }
       }
       if (disposers.length > 0) {
-        granted.set(session, () => { for (const dispose of disposers) { try { dispose() } catch {} } })
+        let active = true
+        granted.set(session, () => {
+          if (!active) return
+          active = false
+          for (const dispose of disposers) { try { dispose() } catch {} }
+          note('revoked roots for session ' + (session.id ?? '?'))
+        })
       }
     } catch (error) {
-      /* 静默：授权失败退化为原来的拒绝 + 提权路径，不打断会话 */
       note('failed: ' + (error && error.message))
     }
   }
 
-  // 会话一建立就授权；恢复/派生的会话在下一个 turn/start 补登记。
+  const revoke = (session) => {
+    try {
+      const dispose = session && granted.get(session)
+      if (dispose) dispose()
+      if (session) granted.delete(session)
+    } catch {
+      /* Session teardown must remain contained. */
+    }
+  }
+
   ctx.on('session/created', (session) => { grant(session) })
-  // 不带 global 选项：与同包 checkpoint.mjs 已验证可用的 session/event 写法保持一致。
   ctx.on('session/event', (session, event) => {
     if (event?.type === 'turn/start') grant(session)
   })
+  ctx.on('session/disposed', (session) => { revoke(session) })
 }
